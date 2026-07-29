@@ -188,8 +188,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
           OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
-          DEEPSEEK_API_TOKEN: ${{ secrets.DEEPSEEK_API_TOKEN }}
-          GEMINI_API_TOKEN: ${{ secrets.GEMINI_API_TOKEN }}
           SOURCE_REPO: ${{ env.SOURCE_REPO }}
           TARGET_REPO: ${{ env.SOURCE_REPO }}
           SOURCE_BRANCH: ${{ env.SOURCE_BRANCH }}

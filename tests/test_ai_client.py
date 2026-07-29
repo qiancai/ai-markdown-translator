@@ -192,5 +192,82 @@ class AIClientTokenLimitTest(unittest.TestCase):
         self.assertEqual(result.completion_reason, "MAX_TOKENS")
 
 
+class AIClientCredentialIsolationTest(unittest.TestCase):
+    def test_deepseek_rejects_missing_or_empty_credential(self):
+        for missing_key in (None, ""):
+            with self.subTest(missing_key=missing_key), mock.patch.object(
+                ai_client_module, "DEEPSEEK_API_KEY", missing_key
+            ), mock.patch("openai.OpenAI") as openai_client:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "DEEPSEEK_API_TOKEN environment variable must be set",
+                ):
+                    UnifiedAIClient(provider="deepseek")
+
+                openai_client.assert_not_called()
+
+    def test_deepseek_initializes_without_other_provider_credentials(self):
+        with mock.patch.object(
+            ai_client_module, "DEEPSEEK_API_KEY", "deepseek-test-key"
+        ), mock.patch.object(
+            ai_client_module, "GEMINI_API_KEY", None
+        ), mock.patch.object(
+            ai_client_module, "AZURE_OPENAI_KEY", None
+        ), mock.patch(
+            "openai.OpenAI"
+        ) as openai_client:
+            client = UnifiedAIClient(provider="deepseek")
+
+        openai_client.assert_called_once_with(
+            api_key="deepseek-test-key",
+            base_url=ai_client_module.DEEPSEEK_BASE_URL,
+        )
+        self.assertEqual(client.provider, "deepseek")
+
+    def test_gemini_initializes_without_other_provider_credentials(self):
+        gemini_client = mock.Mock()
+        fake_genai = SimpleNamespace(Client=gemini_client)
+
+        with mock.patch.object(
+            ai_client_module, "GEMINI_AVAILABLE", True
+        ), mock.patch.object(
+            ai_client_module, "_GEMINI_NEW_SDK", True
+        ), mock.patch.object(
+            ai_client_module, "genai", fake_genai
+        ), mock.patch.object(
+            ai_client_module, "GEMINI_API_KEY", "gemini-test-key"
+        ), mock.patch.object(
+            ai_client_module, "DEEPSEEK_API_KEY", None
+        ), mock.patch.object(
+            ai_client_module, "AZURE_OPENAI_KEY", None
+        ):
+            client = UnifiedAIClient(provider="gemini")
+
+        gemini_client.assert_called_once_with(api_key="gemini-test-key")
+        self.assertEqual(client.provider, "gemini")
+
+    def test_azure_initializes_without_other_provider_credentials(self):
+        with mock.patch.object(
+            ai_client_module, "AZURE_OPENAI_KEY", "azure-test-key"
+        ), mock.patch.object(
+            ai_client_module,
+            "AZURE_OPENAI_BASE_URL",
+            "https://azure.example.test/openai/v1",
+        ), mock.patch.object(
+            ai_client_module, "DEEPSEEK_API_KEY", None
+        ), mock.patch.object(
+            ai_client_module, "GEMINI_API_KEY", None
+        ), mock.patch(
+            "openai.OpenAI"
+        ) as openai_client:
+            client = UnifiedAIClient(provider="azure")
+
+        openai_client.assert_called_once_with(
+            api_key="azure-test-key",
+            base_url="https://azure.example.test/openai/v1",
+        )
+        self.assertEqual(client.provider, "azure")
+
+
 if __name__ == "__main__":
     unittest.main()

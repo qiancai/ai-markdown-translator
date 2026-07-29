@@ -153,10 +153,10 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEEPSEEK_API_TOKEN: ${{ secrets.DEEPSEEK_API_TOKEN }}
-          GEMINI_API_TOKEN: ${{ secrets.GEMINI_API_TOKEN }}
-          AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          DEEPSEEK_API_TOKEN: ${{ github.event.inputs.ai_provider == 'deepseek' && secrets.DEEPSEEK_API_TOKEN || '' }}
+          GEMINI_API_TOKEN: ${{ github.event.inputs.ai_provider == 'gemini' && secrets.GEMINI_API_TOKEN || '' }}
+          AZURE_OPENAI_KEY: ${{ github.event.inputs.ai_provider == 'azure' && secrets.AZURE_OPENAI_KEY || '' }}
+          OPENAI_BASE_URL: ${{ github.event.inputs.ai_provider == 'azure' && secrets.AZURE_OPENAI_BASE_URL || '' }}
           SOURCE_PR_URL: ${{ github.event.inputs.source_pr_url }}
           TARGET_PR_URL: ${{ github.event.inputs.target_pr_url }}
           AI_PROVIDER: ${{ github.event.inputs.ai_provider }}

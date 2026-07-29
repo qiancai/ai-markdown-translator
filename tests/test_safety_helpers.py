@@ -120,5 +120,53 @@ class WorkflowActionPinTest(unittest.TestCase):
                 self.assertEqual(len(expected), 40)
 
 
+class WorkflowProviderSecretScopingTest(unittest.TestCase):
+    def test_pr_workflow_only_populates_the_selected_provider_secrets(self):
+        content = Path(
+            REPO_ROOT, "sync-doc-pr-zh-to-en.yml"
+        ).read_text(encoding="utf-8")
+
+        expected_bindings = (
+            "DEEPSEEK_API_TOKEN: ${{ github.event.inputs.ai_provider == "
+            "'deepseek' && secrets.DEEPSEEK_API_TOKEN || '' }}",
+            "GEMINI_API_TOKEN: ${{ github.event.inputs.ai_provider == "
+            "'gemini' && secrets.GEMINI_API_TOKEN || '' }}",
+            "AZURE_OPENAI_KEY: ${{ github.event.inputs.ai_provider == "
+            "'azure' && secrets.AZURE_OPENAI_KEY || '' }}",
+            "OPENAI_BASE_URL: ${{ github.event.inputs.ai_provider == "
+            "'azure' && secrets.AZURE_OPENAI_BASE_URL || '' }}",
+        )
+
+        for binding in expected_bindings:
+            with self.subTest(binding=binding):
+                self.assertIn(binding, content)
+
+        unconditional_bindings = (
+            "DEEPSEEK_API_TOKEN: ${{ secrets.DEEPSEEK_API_TOKEN }}",
+            "GEMINI_API_TOKEN: ${{ secrets.GEMINI_API_TOKEN }}",
+            "AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}",
+            "OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}",
+        )
+        for binding in unconditional_bindings:
+            with self.subTest(binding=binding):
+                self.assertNotIn(binding, content)
+
+    def test_fixed_azure_workflow_does_not_inject_other_provider_secrets(self):
+        content = Path(
+            REPO_ROOT, "sync-doc-updates-zh-to-en.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}",
+            content,
+        )
+        self.assertIn(
+            "OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}",
+            content,
+        )
+        self.assertNotIn("DEEPSEEK_API_TOKEN:", content)
+        self.assertNotIn("GEMINI_API_TOKEN:", content)
+
+
 if __name__ == "__main__":
     unittest.main()
