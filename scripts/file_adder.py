@@ -336,6 +336,7 @@ IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
 2. Do NOT translate:
    - Code examples, SQL queries, configuration values, doc variables/placeholders such as {doc_variable_example}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
+   - `<CustomContent ...>` and `</CustomContent>` tags. Preserve each tag, its attributes, and its placement exactly, while translating natural-language text inside inline `CustomContent` normally.
    - Explicit anchors such as {{#example-test}} in the section titles.
    - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
@@ -381,7 +382,11 @@ Glossary for terms in {source_language} and {target_language}:
             print(f"      📝 Input: {char_count:,} characters")
             print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
     
-    source_line_count = len(batch_content.split('\n'))
+    # Batch separators belong to the caller and are commonly omitted by the
+    # model, then restored when translated blocks are reassembled. Exclude only
+    # trailing line breaks from this truncation heuristic so a one-line
+    # paragraph ending in ``\n\n`` is compared as one line, not three.
+    source_line_count = len(batch_content.rstrip("\r\n").splitlines())
 
     ai_response = ai_client.chat_completion(
         messages=[{"role": "user", "content": prompt}],
@@ -403,7 +408,9 @@ Glossary for terms in {source_language} and {target_language}:
         source_mode=source_mode,
     )
 
-    translated_line_count = len(translated_content.split('\n'))
+    translated_line_count = len(
+        translated_content.rstrip("\r\n").splitlines()
+    )
     if translated_line_count < source_line_count * 0.6:
         thread_safe_print(
             f"   ⚠️  Translated batch has significantly fewer lines "

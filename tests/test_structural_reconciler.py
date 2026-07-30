@@ -9,6 +9,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from structural_reconciler import (
     _deterministic_version_mark_inner,
+    _protect_custom_content_tags,
     _restore_markdown_indentation,
     _section_similarity_text,
     _split_into_heading_sections,
@@ -236,7 +237,39 @@ class ReconcileWrappingTest(unittest.TestCase):
         self.assertIn("## 丙\n\n丙保持不变。", out)
         self.assertFalse(any("<CustomContent" in content for content in ai.contents()))
 
-    def test_inline_custom_content_tags_are_hidden_from_ai_and_restored(self):
+    def test_inline_custom_content_tags_are_sent_to_ai_unchanged(self):
+        base = "# Title\n\nPremium instances are supported.\n"
+        head = (
+            "# Title\n\nPremium "
+            '<CustomContent plan="byoc">and BYOC </CustomContent>'
+            "instances are supported.\n"
+        )
+        target = "# 标题\n\n支持 Premium 实例。\n"
+
+        class SyntheticPlaceholderDroppingAI(MockAI):
+            def chat_completion(self, messages, temperature=0.1):
+                self.calls.append(messages)
+                content = self._content_portion(messages[0]["content"])
+                return content.replace(
+                    "{{{ .__ai_custom_content_tag_0_0000 }}}", ""
+                ).replace(
+                    "{{{ .__ai_custom_content_tag_0_0001 }}}", ""
+                )
+
+        ai = SyntheticPlaceholderDroppingAI()
+        out = reconcile_restructured_file(
+            "inline-tags.md", head, base, target, ai, REPO_CONFIG,
+            source_mode="commit",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(_tags(head), _tags(out))
+        self.assertTrue(any("CustomContent" in content for content in ai.contents()))
+        self.assertFalse(
+            any("__ai_custom_content_tag_" in content for content in ai.contents())
+        )
+
+    def test_changed_inline_custom_content_tag_declines_on_final_validation(self):
         base = "# Title\n\nPremium instances are supported.\n"
         head = (
             "# Title\n\nPremium "
@@ -251,24 +284,40 @@ class ReconcileWrappingTest(unittest.TestCase):
                 content = self._content_portion(messages[0]["content"])
                 return content.replace("</CustomContent>", "")
 
-        ai = TagManglingAI()
         out = reconcile_restructured_file(
-            "inline-tags.md", head, base, target, ai, REPO_CONFIG,
-            source_mode="commit",
+            "mangled-inline-tag.md", head, base, target,
+            TagManglingAI(), REPO_CONFIG, source_mode="commit",
         )
 
-        self.assertIsNotNone(out)
-        self.assertEqual(_tags(head), _tags(out))
-        self.assertFalse(any("CustomContent" in content for content in ai.contents()))
+        self.assertIsNone(out)
+
+    def test_only_standalone_custom_content_tags_are_protected(self):
+        content = (
+            'Premium <CustomContent plan="byoc">or BYOC</CustomContent> instance.\n\n'
+            '    <CustomContent plan="premium">\n\n'
+            "    Premium-only content.\n\n"
+            "    </CustomContent>\n"
+        )
+
+        protected, tags, placeholders, _ = _protect_custom_content_tags(content)
+
+        self.assertIn(
+            '<CustomContent plan="byoc">or BYOC</CustomContent>',
+            protected,
+        )
+        self.assertNotIn('<CustomContent plan="premium">', protected)
+        self.assertEqual(
+            ['<CustomContent plan="premium">', "</CustomContent>"],
+            tags,
+        )
+        self.assertEqual(2, len(placeholders))
 
     def test_changed_custom_content_placeholder_declines_safely(self):
-        base = "# Title\n\nPremium instances are supported.\n"
-        head = (
-            "# Title\n\nPremium "
-            '<CustomContent plan="byoc">and BYOC </CustomContent>'
-            "instances are supported.\n"
+        content = (
+            '<CustomContent plan="byoc">\n\n'
+            "BYOC instances are supported.\n\n"
+            "</CustomContent>\n"
         )
-        target = "# 标题\n\n支持 Premium 实例。\n"
 
         class PlaceholderDroppingAI(MockAI):
             def chat_completion(self, messages, temperature=0.1):
@@ -278,9 +327,12 @@ class ReconcileWrappingTest(unittest.TestCase):
                 end = content.index("}}}", start) + 3
                 return content[:start] + content[end:]
 
-        out = reconcile_restructured_file(
-            "dropped-placeholder.md", head, base, target,
-            PlaceholderDroppingAI(), REPO_CONFIG, source_mode="commit",
+        out = _translate_preserving_custom_content(
+            content,
+            PlaceholderDroppingAI(),
+            "English",
+            "Chinese",
+            source_mode="commit",
         )
 
         self.assertIsNone(out)

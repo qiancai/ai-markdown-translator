@@ -22,6 +22,53 @@ from ai_client import CompletionText
 
 
 class FileAdderRegressionTest(unittest.TestCase):
+    def test_trailing_batch_newlines_do_not_trigger_truncation_warning(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return "翻译后的单行段落。"
+
+        with mock.patch("file_adder.thread_safe_print") as print_mock:
+            translated = translate_file_batch(
+                "A single-line source paragraph.\n\n",
+                FakeAIClient(),
+                source_language="English",
+                target_language="Chinese",
+            )
+
+        self.assertEqual([], translated.partial_reasons)
+        self.assertFalse(
+            any(
+                "significantly fewer lines" in str(call)
+                for call in print_mock.call_args_list
+            )
+        )
+
+    def test_real_line_count_drop_still_triggers_truncation_warning(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return "只有一行。"
+
+        with mock.patch("file_adder.thread_safe_print") as print_mock:
+            translated = translate_file_batch(
+                "Line one.\nLine two.\nLine three.\nLine four.\nLine five.\n",
+                FakeAIClient(),
+                source_language="English",
+                target_language="Chinese",
+            )
+
+        self.assertTrue(
+            any(
+                "1 lines versus 5 source lines" in reason
+                for reason in translated.partial_reasons
+            )
+        )
+        self.assertTrue(
+            any(
+                "significantly fewer lines" in str(call)
+                for call in print_mock.call_args_list
+            )
+        )
+
     def test_incomplete_added_file_response_is_written_and_reported_as_partial(self):
         class FakeAIClient:
             def chat_completion(self, messages, temperature=0.1):

@@ -461,8 +461,30 @@ def _split_into_heading_sections(content):
 
 
 def _protect_custom_content_tags(content):
-    """Replace CustomContent tags with unique immutable placeholders."""
-    matches = list(_CUSTOM_CONTENT_TAG_RE.finditer(content or ""))
+    """Replace standalone CustomContent tags with immutable placeholders.
+
+    A tag is standalone only when the rest of its line is whitespace. Inline
+    tags remain visible to the model because they delimit sentence-level
+    conditional content that the model needs to understand and translate
+    naturally. The complete reconciled document is still validated against the
+    source CustomContent sequence, so an altered inline tag is rejected later.
+    """
+
+    def is_standalone(match):
+        line_start = content.rfind("\n", 0, match.start()) + 1
+        line_end = content.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(content)
+        return (
+            not content[line_start : match.start()].strip()
+            and not content[match.end() : line_end].strip()
+        )
+
+    matches = [
+        match
+        for match in _CUSTOM_CONTENT_TAG_RE.finditer(content or "")
+        if is_standalone(match)
+    ]
     if not matches:
         return content, [], [], ""
 
@@ -533,12 +555,12 @@ def _restore_markdown_indentation(source_content, translated_content):
 
 
 def _translate_preserving_custom_content(content, *args, **kwargs):
-    """Translate text while keeping every CustomContent tag byte-for-byte.
+    """Translate text while protecting standalone CustomContent tags.
 
-    CustomContent is document structure, not natural language. It must never be
-    entrusted to the model, including when a tag appears inline with prose.
-    Placeholders preserve sentence-level translation context while allowing the
-    original tags to be restored deterministically afterward.
+    Standalone tags are structural boundaries and are hidden behind immutable
+    placeholders. Inline tags stay in the translation input because they carry
+    sentence-level conditional meaning. Full-document structure validation
+    rejects any inline tag that the model changes.
     """
     protected, tags, placeholders, prefix = _protect_custom_content_tags(content)
     translated = translate_file_batch(protected, *args, **kwargs)
