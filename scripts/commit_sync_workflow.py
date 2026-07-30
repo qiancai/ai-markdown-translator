@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+from collections import Counter
 
 from github import Auth, Github
 
@@ -61,6 +62,10 @@ from diff_analyzer import (
     remove_related_resources_resource_card_sections,
 )
 from file_adder import process_added_files
+from file_updater import (
+    extract_added_explicit_heading_anchors,
+    preprocess_diff_for_heading_anchor_stability,
+)
 from structural_reconciler import reconcile_restructured_file
 from file_deleter import process_deleted_files
 from file_io import atomic_write_text
@@ -88,7 +93,10 @@ from main_workflow import (
 )
 from index_file_processor import process_index_file
 from toc_processor import process_toc_file
-from translation_structure_validator import validate_markdown_heading_structures
+from translation_structure_validator import (
+    extract_source_heading_identities,
+    validate_markdown_heading_structures,
+)
 from workflow_ignore_config import load_workflow_ignore_config
 from workflow_outcome import FileOutcomes, RunReport
 from special_file_utils import path_resource_key
@@ -503,6 +511,8 @@ def validate_successful_translation_structures(
     diff_context,
     github_client,
     translation_stats,
+    repo_config=None,
+    pr_diff="",
 ):
     """Validate document structure for successfully translated Markdown files."""
     markdown_file_paths = {
@@ -522,8 +532,20 @@ def validate_successful_translation_structures(
         and diff_context.get("mode") == "commit"
         and should_ignore_resource_card_section(diff_context.get("repo_config"))
     )
+    effective_repo_config = (
+        repo_config
+        or (
+            diff_context.get("repo_config")
+            if isinstance(diff_context, dict)
+            else None
+        )
+        or {}
+    )
+    source_content_cache = {}
 
     def load_source_for_structure_validation(file_path):
+        if file_path in source_content_cache:
+            return source_content_cache[file_path]
         source_content = get_source_ref_content(
             file_path,
             diff_context,
@@ -534,6 +556,7 @@ def validate_successful_translation_structures(
             source_content, _ = remove_related_resources_resource_card_sections(
                 source_content
             )
+        source_content_cache[file_path] = source_content
         return source_content
 
     def load_target_for_structure_validation(file_path):
@@ -544,6 +567,34 @@ def validate_successful_translation_structures(
             )
         return target_content
 
+    def load_expected_heading_anchors(file_path):
+        file_diff = extract_file_diff_from_pr(pr_diff, file_path)
+        if not file_diff:
+            return []
+
+        prompt_diff = preprocess_diff_for_heading_anchor_stability(
+            file_diff,
+            effective_repo_config.get("source_language", ""),
+            effective_repo_config.get("target_language", ""),
+            source_mode=(
+                diff_context.get("mode", "")
+                if isinstance(diff_context, dict)
+                else ""
+            ),
+        )
+        expected = extract_added_explicit_heading_anchors(prompt_diff)
+        if not expected:
+            return []
+
+        source_content = load_source_for_structure_validation(file_path)
+        source_counts = Counter(extract_source_heading_identities(source_content))
+        canonical_expected = []
+        for anchor in expected:
+            if source_counts[anchor] > 0:
+                canonical_expected.append(anchor)
+                source_counts[anchor] -= 1
+        return canonical_expected
+
     issues = validate_markdown_heading_structures(
         markdown_file_paths,
         # Validate the same canonical source view that commit-mode translation
@@ -551,6 +602,7 @@ def validate_successful_translation_structures(
         # incorrectly reported as a missing target heading.
         source_content_loader=load_source_for_structure_validation,
         target_content_loader=load_target_for_structure_validation,
+        expected_heading_anchors_loader=load_expected_heading_anchors,
     )
 
     if not issues:
@@ -1839,6 +1891,8 @@ def process_translation_group(
         diff_context,
         github_client,
         translation_stats,
+        repo_config=repo_config,
+        pr_diff=pr_diff,
     )
 
     counts = {

@@ -2297,6 +2297,57 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertEqual([], issues)
         self.assertEqual([], stats.structure_errors)
 
+    def test_structure_validation_reports_changed_heading_anchor_missing_from_target(self):
+        stats = workflow.TranslationStats()
+        stats.mark_success("guide.md")
+        source = "# Guide\n\n## Audit filter events\n"
+        target = "# ガイド\n\n## 監査フィルターイベント\n"
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -3,1 +3,1 @@",
+                "-## Auditing filter events",
+                "+## Audit filter events",
+                "-" * 80,
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "guide.md").write_text(target, encoding="utf-8")
+            with mock.patch.object(
+                workflow,
+                "TARGET_REPO_PATH",
+                tmpdir,
+            ), mock.patch.object(
+                workflow,
+                "get_source_ref_content",
+                return_value=source,
+            ):
+                issues = workflow.validate_successful_translation_structures(
+                    {"guide.md"},
+                    {
+                        "mode": "commit",
+                        "head_ref": "head",
+                        "repo_config": {
+                            "source_language": "English",
+                            "target_language": "Japanese",
+                        },
+                    },
+                    object(),
+                    stats,
+                    repo_config={
+                        "source_language": "English",
+                        "target_language": "Japanese",
+                    },
+                    pr_diff=pr_diff,
+                )
+
+        self.assertEqual(
+            ["expected heading anchors are missing"],
+            [issue.reason for issue in issues],
+        )
+        self.assertEqual(1, len(stats.structure_errors))
+
 
 if __name__ == "__main__":
     unittest.main()

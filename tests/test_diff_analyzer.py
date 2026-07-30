@@ -2379,6 +2379,239 @@ class HeadingLevelOnlyChangeTest(unittest.TestCase):
         self.assertEqual(entry["old_heading_level"], 2)
         self.assertEqual(entry["new_heading_level"], 3)
 
+    def test_added_section_anchors_before_immediately_renamed_section(self):
+        base_content = (
+            "# Audit\n\n"
+            "## Specify auditing filter rules\n\n"
+            "Old filter text.\n\n"
+            "## View audit logs\n\n"
+            "View text.\n"
+        )
+        head_content = (
+            "# Audit\n\n"
+            "## Configure database audit logging settings\n\n"
+            "Configure text.\n\n"
+            "## Specify audit filter rules\n\n"
+            "New filter text.\n\n"
+            "## View audit logs\n\n"
+            "View text.\n"
+        )
+        base_hierarchy = build_hierarchy_dict(base_content)
+        head_hierarchy = build_hierarchy_dict(head_content)
+
+        result = build_source_diff_dict(
+            modified_sections={7: head_hierarchy[7]},
+            added_sections={3: head_hierarchy[3]},
+            deleted_sections={},
+            all_hierarchy_dict=head_hierarchy,
+            base_hierarchy_dict=base_hierarchy,
+            operations={
+                "added_lines": [
+                    {
+                        "line_number": 3,
+                        "is_header": True,
+                        "content": "## Configure database audit logging settings",
+                    },
+                ],
+                "deleted_lines": [],
+                "modified_lines": [
+                    {
+                        "line_number": 7,
+                        "is_header": True,
+                        "content": "## Specify audit filter rules",
+                        "original_content": "## Specify auditing filter rules",
+                    },
+                ],
+            },
+            file_content=head_content,
+            base_file_content=base_content,
+        )
+
+        self.assertEqual(
+            "## Specify auditing filter rules",
+            result["added_3"]["original_hierarchy"],
+        )
+
+    def test_added_section_uses_parent_path_for_duplicate_renamed_anchor(self):
+        base_content = (
+            "# Guide\n\n"
+            "## First workflow\n\n"
+            "### Existing step\n\n"
+            "## Second workflow\n\n"
+            "### Existing step\n"
+        )
+        head_content = (
+            "# Guide\n\n"
+            "## First workflow\n\n"
+            "### Existing step\n\n"
+            "## Second workflow\n\n"
+            "### New prerequisite\n\n"
+            "### Renamed step\n"
+        )
+        base_hierarchy = build_hierarchy_dict(base_content)
+        head_hierarchy = build_hierarchy_dict(head_content)
+
+        result = build_source_diff_dict(
+            modified_sections={},
+            added_sections={9: head_hierarchy[9]},
+            deleted_sections={},
+            all_hierarchy_dict=head_hierarchy,
+            base_hierarchy_dict=base_hierarchy,
+            operations={
+                "added_lines": [
+                    {
+                        "line_number": 9,
+                        "is_header": True,
+                        "content": "### New prerequisite",
+                    },
+                ],
+                "deleted_lines": [],
+                "modified_lines": [
+                    {
+                        "line_number": 11,
+                        "is_header": True,
+                        "content": "### Renamed step",
+                        "original_content": "### Existing step",
+                    },
+                ],
+            },
+            file_content=head_content,
+            base_file_content=base_content,
+        )
+
+        self.assertEqual(
+            "## Second workflow > ### Existing step",
+            result["added_9"]["original_hierarchy"],
+        )
+
+    def test_modified_anchor_fallback_uses_head_titles_for_ordinal_matching(self):
+        base_content = (
+            "# Guide\n"
+            "## X\n"
+            "### B\n"
+            "#### New\n"
+            "## Y\n"
+            "### B\n"
+            "#### New\n"
+            "## U\n"
+            "### Old\n"
+            "## V\n"
+            "### Old\n"
+        )
+        head_content = (
+            "# Guide\n"
+            "## X\n"
+            "### B\n"
+            "#### New\n"
+            "## A\n"
+            "### B\n"
+            "#### Added\n"
+            "#### New\n"
+            "## Y\n"
+            "### B\n"
+            "#### New\n"
+            "## U\n"
+            "## V\n"
+        )
+        base_hierarchy = build_hierarchy_dict(base_content)
+        head_hierarchy = build_hierarchy_dict(head_content)
+
+        result = build_source_diff_dict(
+            modified_sections={},
+            added_sections={7: head_hierarchy[7]},
+            deleted_sections={},
+            all_hierarchy_dict=head_hierarchy,
+            base_hierarchy_dict=base_hierarchy,
+            operations={
+                "added_lines": [
+                    {
+                        "line_number": 7,
+                        "is_header": True,
+                        "content": "#### Added",
+                    },
+                ],
+                "deleted_lines": [],
+                "modified_lines": [
+                    {
+                        "line_number": 8,
+                        "is_header": True,
+                        "content": "#### New",
+                        "original_content": "#### Old",
+                    },
+                ],
+            },
+            file_content=head_content,
+            base_file_content=base_content,
+        )
+
+        self.assertEqual(
+            "## Y > ### B > #### New",
+            result["added_7"]["original_hierarchy"],
+        )
+
+    def test_duplicate_anchor_tie_uses_nearest_global_base_ordinal(self):
+        base_content = (
+            "# Guide\n"
+            "## Alpha\n"
+            "### Shared\n"
+            "#### Step\n"
+            "## Other\n"
+            "### Different\n"
+            "#### Step\n"
+            "#### Step\n"
+            "## Beta\n"
+            "### Shared\n"
+            "#### Step\n"
+        )
+        head_content = (
+            "# Guide\n"
+            "## Other\n"
+            "### Different\n"
+            "#### Step\n"
+            "## Current\n"
+            "### Shared\n"
+            "#### Added\n"
+            "#### Step\n"
+        )
+        base_hierarchy = build_hierarchy_dict(base_content)
+        head_hierarchy = build_hierarchy_dict(head_content)
+
+        with mock.patch("builtins.print") as print_mock:
+            result = build_source_diff_dict(
+                modified_sections={},
+                added_sections={7: head_hierarchy[7]},
+                deleted_sections={},
+                all_hierarchy_dict=head_hierarchy,
+                base_hierarchy_dict=base_hierarchy,
+                operations={
+                    "added_lines": [
+                        {
+                            "line_number": 7,
+                            "is_header": True,
+                            "content": "#### Added",
+                        },
+                    ],
+                    "deleted_lines": [],
+                    "modified_lines": [],
+                },
+                file_content=head_content,
+                base_file_content=base_content,
+            )
+
+        self.assertEqual(
+            "## Alpha > ### Shared > #### Step",
+            result["added_7"]["original_hierarchy"],
+        )
+        log_output = "\n".join(
+            " ".join(str(arg) for arg in call.args)
+            for call in print_mock.call_args_list
+        )
+        self.assertIn(
+            "candidates tied at parent-hierarchy score 1",
+            log_output,
+        )
+        self.assertIn("HEAD ordinal 1, BASE ordinal 0", log_output)
+
     def test_build_source_diff_dict_collapses_add_delete_heading_level_pair(self):
         """Added+deleted heading-level pairs should become one modified entry."""
         base_content = "# Title\n\n## Parent\n\n## Child\n\nBody text.\n"

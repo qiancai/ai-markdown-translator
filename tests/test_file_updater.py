@@ -18,9 +18,11 @@ from file_updater import (
     _prepare_translation_prompt,
     build_heading_anchor_slug,
     build_translation_chunks,
+    filter_diff_for_chunk_sections,
     get_translation_chunk_max_sections,
     get_updated_sections_from_ai,
     preprocess_diff_for_heading_anchor_stability,
+    preprocess_source_sections_for_heading_anchor_stability,
     process_single_file,
     update_target_document_from_match_data,
 )
@@ -137,6 +139,39 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             source_sections[key] = f"### `{name}`\n\nOld English content{term}.\n"
             target_sections[key] = f"### `{name}`\n\n旧中文内容{index}。\n"
         return source_sections, target_sections
+
+    def _build_system_section_diff(
+        self,
+        count,
+        replacement_terms=None,
+        group_size=20,
+    ):
+        replacement_terms = replacement_terms or {}
+        lines = ["File: system-variables.md"]
+        for start in range(1, count + 1, group_size):
+            end = min(start + group_size - 1, count)
+            group_count = end - start + 1
+            group_replacements = {
+                index: replacement
+                for index, replacement in replacement_terms.items()
+                if start <= index <= end
+            }
+            if not group_replacements:
+                group_replacements = {
+                    start: f"updated content {start}",
+                }
+
+            lines.append(
+                f"@@ -{start},{group_count} +{start},{group_count} @@"
+            )
+            for index, replacement in sorted(group_replacements.items()):
+                lines.extend(
+                    [
+                        f"-old content {index}",
+                        f"+{replacement}",
+                    ]
+                )
+        return "\n".join(lines)
 
     def test_build_heading_anchor_slug_keeps_visible_text_inside_span(self):
         heading = '`txn-entry-size-limit` <span class="version-mark">New in v4.0.10 and v5.0.0</span>'
@@ -433,6 +468,1086 @@ class FileUpdaterRegressionTest(unittest.TestCase):
         self.assertIn("Preserve HTML/MDX component tags exactly", prompt)
         self.assertIn('<CustomContent plan="premium">', prompt)
         self.assertIn("</CustomContent>", prompt)
+
+    def test_prompt_applies_the_same_changed_heading_anchor_to_source_and_diff(self):
+        pr_diff = "\n".join(
+            [
+                "File: tidb-cloud/tidb-cloud-auditing.md",
+                "@@ -40,1 +40,1 @@",
+                "-## Auditing filter events",
+                "+## Audit filter events",
+            ]
+        )
+
+        prompt, prompt_diff = _prepare_translation_prompt(
+            pr_diff,
+            {"modified_40": "## Audit filter events\n\nNew content.\n"},
+            {"modified_40": "## 監査フィルターイベント\n\n古い内容。\n"},
+            "English",
+            "Japanese",
+            "commit",
+        )
+
+        expected_heading = "## Audit filter events {#audit-filter-events}"
+        self.assertIn(f"+{expected_heading}", prompt_diff)
+        self.assertIn(expected_heading, prompt)
+
+    def test_source_anchor_preprocessing_skips_fenced_heading_examples(self):
+        prompt_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -1,1 +1,1 @@",
+                "+## Real heading {#real-heading}",
+                "+```md",
+                "+## Code heading {#code-heading}",
+                "+```",
+            ]
+        )
+
+        processed = preprocess_source_sections_for_heading_anchor_stability(
+            {
+                "modified_1": (
+                    "## Real heading\n\n"
+                    "```md\n"
+                    "## Code heading\n"
+                    "```\n"
+                )
+            },
+            prompt_diff,
+        )
+
+        self.assertIn("## Real heading {#real-heading}", processed["modified_1"])
+        self.assertIn("## Code heading\n", processed["modified_1"])
+        self.assertNotIn("## Code heading {#code-heading}", processed["modified_1"])
+
+    def test_prompt_diff_uses_source_section_to_reject_mid_fence_heading(self):
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "@@ -20,1 +20,1 @@",
+                "-## Old code example",
+                "+## New code example",
+            ]
+        )
+        source_sections = {
+            "modified_10": (
+                "## Real section\n\n"
+                "```md\n"
+                "## New code example\n"
+                "```\n"
+            )
+        }
+
+        prompt, prompt_diff = _prepare_translation_prompt(
+            pr_diff,
+            source_sections,
+            {
+                "modified_10": (
+                    "## 実際のセクション\n\n"
+                    "```md\n"
+                    "## 新しいコード例\n"
+                    "```\n"
+                )
+            },
+            "English",
+            "Japanese",
+            "commit",
+        )
+
+        self.assertIn("+## New code example", prompt_diff)
+        self.assertNotIn("{#new-code-example}", prompt_diff)
+        self.assertNotIn("{#new-code-example}", prompt)
+
+    def test_ai_output_heading_anchor_is_restored_programmatically(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                return json.dumps(
+                    {
+                        "modified_40": (
+                            "## 監査フィルターイベント\n\n新しい内容。\n"
+                        )
+                    }
+                )
+
+        prefix = "restore-heading-anchor-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: tidb-cloud/tidb-cloud-auditing.md",
+                        "@@ -40,1 +40,1 @@",
+                        "-## Auditing filter events",
+                        "+## Audit filter events",
+                    ]
+                ),
+                {
+                    "modified_40": (
+                        "## 監査イベント "
+                        "{#auditing-filter-events}\n\n古い内容。\n"
+                    )
+                },
+                {
+                    "modified_40": (
+                        "## Audit filter events\n\nNew content.\n"
+                    )
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertIn(
+                "## 監査フィルターイベント {#audit-filter-events}",
+                result["modified_40"],
+            )
+            self.assertNotIn("{#auditing-filter-events}", result["modified_40"])
+            self.assertEqual(len(ai_client.prompts), 1)
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_unchanged_main_ai_h1_is_repaired_by_targeted_translation(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": (
+                                    "# TiDB Cloud Dedicatedデータベース監査ログ"
+                                    "（プレビュー版） "
+                                    "{#ai-must-not-control-anchor}"
+                                ),
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "intro_section": (
+                            "# TiDB Cloud Dedicatedデータベース監査ログ\n\n"
+                            "更新された導入文。\n"
+                        )
+                    }
+                )
+
+        prefix = "unchanged-modified-h1-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+
+            def glossary_matcher(text, source_language=None):
+                if "Preview" not in text:
+                    return []
+                return [
+                    {
+                        "en": "Preview",
+                        "target": "プレビュー版",
+                        "comment": "Use the established Japanese label.",
+                    }
+                ]
+
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: tidb-cloud/tidb-cloud-auditing.md",
+                        "@@ -8,1 +8,1 @@",
+                        "-# TiDB Cloud Dedicated database audit logging "
+                        "{#tidb-cloud-dedicated-database-audit-logging}",
+                        "+# TiDB Cloud Dedicated database audit logging (Preview) "
+                        "{#tidb-cloud-dedicated-database-audit-logging}",
+                    ]
+                ),
+                {
+                    "intro_section": (
+                        "# TiDB Cloud Dedicatedデータベース監査ログ\n\n"
+                        "古い導入文。\n"
+                    )
+                },
+                {
+                    "intro_section": (
+                        "# TiDB Cloud Dedicated database audit logging (Preview) "
+                        "{#tidb-cloud-dedicated-database-audit-logging}\n\n"
+                        "Updated introduction.\n"
+                    )
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                glossary_matcher=glossary_matcher,
+                source_mode="commit",
+            )
+
+            self.assertIn(
+                "# TiDB Cloud Dedicatedデータベース監査ログ（プレビュー版） "
+                "{#tidb-cloud-dedicated-database-audit-logging}",
+                result["intro_section"],
+            )
+            self.assertNotIn(
+                "{#ai-must-not-control-anchor}",
+                result["intro_section"],
+            )
+            self.assertEqual(len(ai_client.prompts), 2)
+            heading_prompt = ai_client.prompts[1]
+            self.assertIn(
+                '"old_source_heading": "# TiDB Cloud Dedicated database '
+                'audit logging"',
+                heading_prompt,
+            )
+            self.assertIn(
+                '"new_source_heading": "# TiDB Cloud Dedicated database '
+                'audit logging (Preview)"',
+                heading_prompt,
+            )
+            self.assertIn(
+                '"old_target_heading": "# TiDB Cloud '
+                'Dedicatedデータベース監査ログ"',
+                heading_prompt,
+            )
+            self.assertNotIn("更新された導入文", heading_prompt)
+            self.assertIn("| Preview | プレビュー版 |", heading_prompt)
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_unchanged_targeted_h1_translation_remains_partial(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": (
+                                    "# TiDB Cloud Dedicatedデータベース監査ログ"
+                                ),
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "intro_section": (
+                            "# TiDB Cloud Dedicatedデータベース監査ログ\n\n"
+                            "更新された導入文。\n"
+                        )
+                    }
+                )
+
+        prefix = "unchanged-targeted-h1-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: tidb-cloud/tidb-cloud-auditing.md",
+                        "@@ -8,1 +8,1 @@",
+                        "-# TiDB Cloud Dedicated database audit logging",
+                        "+# TiDB Cloud Dedicated database audit logging (Preview)",
+                    ]
+                ),
+                {
+                    "intro_section": (
+                        "# TiDB Cloud Dedicatedデータベース監査ログ "
+                        "{#tidb-cloud-dedicated-database-audit-logging}\n\n"
+                        "古い導入文。\n"
+                    )
+                },
+                {
+                    "intro_section": (
+                        "# TiDB Cloud Dedicated database audit logging "
+                        "(Preview)\n\nUpdated introduction.\n"
+                    )
+                },
+                FakeAIClient(),
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertTrue(
+                any(
+                    "targeted heading translation stayed unchanged"
+                    in reason
+                    for reason in result.partial_reasons
+                )
+            )
+            self.assertTrue(
+                any(
+                    "changed source H1 produced an unchanged target H1"
+                    in reason
+                    for reason in result.partial_reasons
+                )
+            )
+            self.assertIn(
+                "# TiDB Cloud Dedicatedデータベース監査ログ "
+                "{#tidb-cloud-dedicated-database-audit-logging}",
+                result["intro_section"],
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_targeted_h1_can_confirm_existing_translation_is_equivalent(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "already_equivalent",
+                                "heading": "# 監査ログを設定する",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "intro_section": (
+                            "# 監査ログを設定する\n\n更新された導入文。\n"
+                        )
+                    }
+                )
+
+        prefix = "equivalent-modified-h1-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -1,1 +1,1 @@",
+                        "-# Configure auditing logging",
+                        "+# Configure audit logging",
+                    ]
+                ),
+                {
+                    "intro_section": (
+                        "# 監査ログを設定する {#configure-auditing-logging}"
+                        "\n\n古い導入文。\n"
+                    )
+                },
+                {
+                    "intro_section": (
+                        "# Configure audit logging\n\nUpdated introduction.\n"
+                    )
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(len(ai_client.prompts), 2)
+            self.assertIn(
+                "# 監査ログを設定する {#configure-auditing-logging}",
+                result["intro_section"],
+            )
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_missing_changed_h1_is_inserted_by_targeted_translation(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "# 新しいタイトル {#wrong-anchor}",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {"intro_section": "更新された導入文。\n"}
+                )
+
+        prefix = "missing-modified-h1-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -1,1 +1,1 @@",
+                        "-# Old title {#stable-title}",
+                        "+# New title {#stable-title}",
+                    ]
+                ),
+                {
+                    "intro_section": (
+                        "# 古いタイトル {#stable-title}\n\n古い導入文。\n"
+                    )
+                },
+                {
+                    "intro_section": (
+                        "# New title {#stable-title}\n\n"
+                        "Updated introduction.\n"
+                    )
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(len(ai_client.prompts), 2)
+            self.assertTrue(
+                result["intro_section"].startswith(
+                    "# 新しいタイトル {#stable-title}\n\n"
+                )
+            )
+            self.assertNotIn("{#wrong-anchor}", result["intro_section"])
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_heading_retry_does_not_fabricate_section_missing_from_main_response(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompts.append(messages[0]["content"])
+                return json.dumps({})
+
+        prefix = "missing-main-section-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -1,1 +1,1 @@",
+                        "-# Old title",
+                        "+# New title",
+                    ]
+                ),
+                {
+                    "intro_section": (
+                        "# 古いタイトル\n\n保持すべき本文。\n"
+                    )
+                },
+                {
+                    "intro_section": (
+                        "# New title\n\nUpdated body.\n"
+                    )
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(1, len(ai_client.prompts))
+            self.assertNotIn("intro_section", result)
+            self.assertTrue(
+                any(
+                    "AI response missing section keys: intro_section" in reason
+                    for reason in result.partial_reasons
+                )
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_missing_heading_inside_custom_content_is_not_moved_outside(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "# 新しいタイトル",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "intro_section": (
+                            '<CustomContent plan="premium">\n'
+                            "更新された本文。\n"
+                            "</CustomContent>\n"
+                        )
+                    }
+                )
+
+        prefix = "custom-content-heading-boundary-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            target_content = (
+                '<CustomContent plan="premium">\n'
+                "# 古いタイトル\n"
+                "古い本文。\n"
+                "</CustomContent>\n"
+            )
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -2,1 +2,1 @@",
+                        "-# Old title",
+                        "+# New title",
+                    ]
+                ),
+                {"intro_section": target_content},
+                {
+                    "intro_section": (
+                        '<CustomContent plan="premium">\n'
+                        "# New title\n"
+                        "Updated body.\n"
+                        "</CustomContent>\n"
+                    )
+                },
+                FakeAIClient(),
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(target_content, result["intro_section"])
+            self.assertTrue(
+                any(
+                    "could not be applied" in reason
+                    for reason in result.partial_reasons
+                )
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_added_technical_heading_can_be_already_equivalent(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "already_equivalent",
+                                "heading": "## TiDB Cloud",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "added_3": (
+                            "## TiDB Cloud\n\nTiDB Cloud の説明。\n"
+                        )
+                    }
+                )
+
+        prefix = "technical-heading-equivalent-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -3,0 +3,2 @@",
+                        "+## TiDB Cloud",
+                        "+",
+                    ]
+                ),
+                {"added_3": ""},
+                {
+                    "added_3": "## TiDB Cloud\n\nDescription.\n",
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(2, len(ai_client.prompts))
+            self.assertIn(
+                "## TiDB Cloud {#tidb-cloud}",
+                result["added_3"],
+            )
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_anchor_only_h1_change_is_not_reported_as_untranslated(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompts.append(messages[0]["content"])
+                return json.dumps(
+                    {
+                        "intro_section": (
+                            "# ガイド {#old-guide}\n\n更新された本文。\n"
+                        )
+                    }
+                )
+
+        prefix = "anchor-only-h1-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -1,1 +1,1 @@",
+                        "-# Guide {#old-guide}",
+                        "+# Guide {#new-guide}",
+                    ]
+                ),
+                {
+                    "intro_section": (
+                        "# ガイド {#old-guide}\n\n古い本文。\n"
+                    )
+                },
+                {
+                    "intro_section": (
+                        "# Guide {#new-guide}\n\nUpdated body.\n"
+                    )
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(1, len(ai_client.prompts))
+            self.assertIn("# ガイド {#old-guide}", result["intro_section"])
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_ambiguous_multi_heading_repair_preserves_main_output(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompts.append(messages[0]["content"])
+                return json.dumps(
+                    {
+                        "modified_10": (
+                            "本文。\n\n### 新しい子見出し\n\n子本文。\n"
+                        )
+                    }
+                )
+
+        prefix = "ambiguous-multi-heading-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -10,2 +10,2 @@",
+                        "-## Old parent",
+                        "+## New parent",
+                        "-### Old child",
+                        "+### New child",
+                    ]
+                ),
+                {
+                    "modified_10": (
+                        "## 古い親\n\n本文。\n\n"
+                        "### 古い子見出し\n\n子本文。\n"
+                    )
+                },
+                {
+                    "modified_10": (
+                        "## New parent\n\nBody.\n\n"
+                        "### New child\n\nChild body.\n"
+                    )
+                },
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(1, len(ai_client.prompts))
+            self.assertNotIn("## 新しい親", result["modified_10"])
+            self.assertIn("### 新しい子見出し", result["modified_10"])
+            self.assertTrue(
+                any(
+                    "ambiguous for multi-heading section modified_10" in reason
+                    for reason in result.partial_reasons
+                )
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_added_headings_are_translated_in_one_targeted_request(self):
+        source_sections = {
+            "added_10": "### SQL statement information\n\nSQL body.\n",
+            "added_20": "### Connection information\n\nConnection body.\n",
+            "added_30": (
+                "### Audit operation information\n\nAudit operation body.\n"
+            ),
+            "added_40": "## Audit logging limitations\n\nLimit body.\n",
+            "added_50": (
+                "## Legacy database audit logging reference\n\nLegacy body.\n"
+            ),
+        }
+        target_sections = {key: "" for key in source_sections}
+
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "### SQL ステートメント情報",
+                            },
+                            "heading_002": {
+                                "status": "updated",
+                                "heading": "### 接続情報",
+                            },
+                            "heading_003": {
+                                "status": "updated",
+                                "heading": "### 監査操作情報",
+                            },
+                            "heading_004": {
+                                "status": "updated",
+                                "heading": "## 監査ログの制限事項",
+                            },
+                            "heading_005": {
+                                "status": "updated",
+                                "heading": (
+                                    "## 従来のデータベース監査ログのリファレンス"
+                                ),
+                            },
+                        }
+                    )
+                return json.dumps(source_sections)
+
+        prefix = "added-heading-translation-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -10,0 +10,2 @@",
+                        "+### SQL statement information",
+                        "+",
+                        "@@ -20,0 +20,2 @@",
+                        "+### Connection information",
+                        "+",
+                        "@@ -30,0 +30,2 @@",
+                        "+### Audit operation information",
+                        "+",
+                        "@@ -40,0 +40,2 @@",
+                        "+## Audit logging limitations",
+                        "+",
+                        "@@ -50,0 +50,2 @@",
+                        "+## Legacy database audit logging reference",
+                        "+",
+                    ]
+                ),
+                target_sections,
+                source_sections,
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(len(ai_client.prompts), 2)
+            self.assertIn(
+                "### SQL ステートメント情報 {#sql-statement-information}",
+                result["added_10"],
+            )
+            self.assertIn(
+                "### 接続情報 {#connection-information}",
+                result["added_20"],
+            )
+            self.assertIn(
+                "### 監査操作情報 {#audit-operation-information}",
+                result["added_30"],
+            )
+            self.assertIn(
+                "## 監査ログの制限事項 {#audit-logging-limitations}",
+                result["added_40"],
+            )
+            self.assertIn(
+                "## 従来のデータベース監査ログのリファレンス "
+                "{#legacy-database-audit-logging-reference}",
+                result["added_50"],
+            )
+            heading_prompt = ai_client.prompts[1]
+            self.assertNotIn("SQL body", heading_prompt)
+            self.assertNotIn("Connection body", heading_prompt)
+            self.assertNotIn("Audit operation body", heading_prompt)
+            self.assertNotIn("Limit body", heading_prompt)
+            self.assertNotIn("Legacy body", heading_prompt)
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_heading_translation_ignores_same_hunk_sections_outside_chunk(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "## 2 番目の新しい章",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {"added_20": "## Second new section\n\nSecond body.\n"}
+                )
+
+        prefix = "heading-hunk-chunk-scope-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -10,0 +10,13 @@",
+                        "+## First new section",
+                        "+",
+                        "+First body.",
+                        "+",
+                        "+## Second new section",
+                        "+",
+                        "+Second body.",
+                    ]
+                ),
+                {"added_20": ""},
+                {
+                    "added_20": (
+                        "## Second new section\n\nSecond body.\n"
+                    )
+                },
+                FakeAIClient(),
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertIn(
+                "## 2 番目の新しい章 {#second-new-section}",
+                result["added_20"],
+            )
+            self.assertFalse(
+                any(
+                    "First new section" in reason
+                    for reason in result.partial_reasons
+                )
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_targeted_heading_translation_rejects_wrong_level(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "## 間違ったレベル",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "intro_section": (
+                            "# 古いタイトル\n\n更新された導入文。\n"
+                        )
+                    }
+                )
+
+        prefix = "wrong-heading-level-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -1,1 +1,1 @@",
+                        "-# Old title",
+                        "+# New title",
+                    ]
+                ),
+                {"intro_section": "# 古いタイトル\n\n古い導入文。\n"},
+                {"intro_section": "# New title\n\nNew introduction.\n"},
+                FakeAIClient(),
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertTrue(
+                any(
+                    "changed heading level" in reason
+                    for reason in result.partial_reasons
+                )
+            )
+            self.assertTrue(
+                result["intro_section"].startswith("# 古いタイトル\n")
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_targeted_heading_translation_rejects_source_language_title(self):
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "# New title",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {"intro_section": "# 古いタイトル\n\n更新された導入文。\n"}
+                )
+
+        prefix = "source-language-heading-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -1,1 +1,1 @@",
+                        "-# Old title",
+                        "+# New title",
+                    ]
+                ),
+                {"intro_section": "# 古いタイトル\n\n古い導入文。\n"},
+                {"intro_section": "# New title\n\nNew introduction.\n"},
+                FakeAIClient(),
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertTrue(
+                any(
+                    "left heading in the source language" in reason
+                    for reason in result.partial_reasons
+                )
+            )
+            self.assertTrue(
+                result["intro_section"].startswith("# 古いタイトル\n")
+            )
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
+
+    def test_old_source_language_heading_is_retried(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_completion(self, messages, temperature=0.1):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "# 新しいタイトル",
+                            }
+                        }
+                    )
+                return json.dumps(
+                    {"intro_section": "# Old title\n\n更新された導入文。\n"}
+                )
+
+        prefix = "old-source-language-heading-unit"
+        self._cleanup_chunk_test_outputs(prefix)
+        try:
+            ai_client = FakeAIClient()
+            result = get_updated_sections_from_ai(
+                "\n".join(
+                    [
+                        "File: guide.md",
+                        "@@ -1,1 +1,1 @@",
+                        "-# Old title",
+                        "+# New title",
+                    ]
+                ),
+                {"intro_section": "# 古いタイトル\n\n古い導入文。\n"},
+                {"intro_section": "# New title\n\nNew introduction.\n"},
+                ai_client,
+                "English",
+                "Japanese",
+                f"{prefix}.md",
+                source_mode="commit",
+            )
+
+            self.assertEqual(len(ai_client.prompts), 2)
+            self.assertTrue(
+                result["intro_section"].startswith("# 新しいタイトル\n")
+            )
+            self.assertFalse(result.partial_reasons)
+        finally:
+            self._cleanup_chunk_test_outputs(prefix)
 
     def test_preprocess_diff_keeps_existing_explicit_anchor(self):
         pr_diff = "\n".join(
@@ -1026,6 +2141,70 @@ class FileUpdaterRegressionTest(unittest.TestCase):
             [REGULAR_TRANSLATION_CHUNK_SIZE, 1],
         )
 
+    def test_chunk_diff_keeps_prefix_and_numeric_section_hunks(self):
+        pr_diff = "\n".join(
+            [
+                "File: tidb-cloud/tidb-cloud-auditing.md",
+                "diff --git a/auditing.md b/auditing.md",
+                "--- a/auditing.md",
+                "+++ b/auditing.md",
+                "@@ -1,20 +1,27 @@",
+                "-title: Audit Logging",
+                "+title: Audit Logging (Preview)",
+                "-Old intro.",
+                "+New public preview intro.",
+                "@@ -33,7 +40,7 @@",
+                "-Old enable text.",
+                "+New enable text.",
+                "@@ -93,7 +100,7 @@",
+                "-Old unrelated text.",
+                "+New unrelated text.",
+            ]
+        )
+
+        filtered = filter_diff_for_chunk_sections(
+            pr_diff,
+            ["frontmatter", "intro_section", "modified_40"],
+            [
+                "frontmatter",
+                "intro_section",
+                "modified_40",
+                "modified_100",
+            ],
+        )
+
+        self.assertIn("@@ -1,20 +1,27 @@", filtered)
+        self.assertIn("+title: Audit Logging (Preview)", filtered)
+        self.assertIn("+New public preview intro.", filtered)
+        self.assertIn("@@ -33,7 +40,7 @@", filtered)
+        self.assertIn("+New enable text.", filtered)
+        self.assertNotIn("@@ -93,7 +100,7 @@", filtered)
+        self.assertNotIn("+New unrelated text.", filtered)
+
+    def test_chunk_diff_falls_back_when_modified_section_has_no_hunk(self):
+        pr_diff = "\n".join(
+            [
+                "File: guide.md",
+                "diff --git a/guide.md b/guide.md",
+                "--- a/guide.md",
+                "+++ b/guide.md",
+                "@@ -38,5 +40,5 @@",
+                "-Old section 40.",
+                "+New section 40.",
+                "@@ -118,5 +120,5 @@",
+                "-Old unrelated section.",
+                "+New unrelated section.",
+            ]
+        )
+
+        filtered = filter_diff_for_chunk_sections(
+            pr_diff,
+            ["modified_40", "modified_80"],
+            ["modified_40", "modified_80", "modified_120"],
+        )
+
+        self.assertEqual(pr_diff, filtered)
+
     def test_chunk_glossary_matching_uses_chunk_filtered_diff(self):
         class FakeAIClient:
             def __init__(self):
@@ -1048,17 +2227,13 @@ class FileUpdaterRegressionTest(unittest.TestCase):
                 return []
 
             get_updated_sections_from_ai(
-                "\n".join([
-                    "File: system-variables.md",
-                    "@@ -1,3 +1,3 @@",
-                    "-old content 1",
-                    "+ChunkDiffOnlyTerm1",
-                    " context",
-                    "@@ -25,3 +25,3 @@",
-                    "-old content 25",
-                    "+ChunkDiffOnlyTerm25",
-                    " context",
-                ]),
+                self._build_system_section_diff(
+                    25,
+                    {
+                        1: "ChunkDiffOnlyTerm1",
+                        25: "ChunkDiffOnlyTerm25",
+                    },
+                ),
                 target_sections,
                 source_sections,
                 FakeAIClient(),
@@ -1140,17 +2315,13 @@ class FileUpdaterRegressionTest(unittest.TestCase):
                 return []
 
             get_updated_sections_from_ai(
-                "\n".join([
-                    "File: system-variables.md",
-                    "@@ -1,3 +1,3 @@",
-                    "-old content 1",
-                    "+DiffOnlyTerm1",
-                    " context",
-                    "@@ -25,3 +25,3 @@",
-                    "-old content 25",
-                    "+DiffOnlyTerm25",
-                    " context",
-                ]),
+                self._build_system_section_diff(
+                    25,
+                    {
+                        1: "DiffOnlyTerm1",
+                        25: "DiffOnlyTerm25",
+                    },
+                ),
                 target_sections,
                 source_sections,
                 FakeAIClient(),
@@ -1220,7 +2391,17 @@ class FileUpdaterRegressionTest(unittest.TestCase):
                 self.prompts = []
 
             def chat_completion(self, messages, temperature=0.1):
-                self.prompts.append(messages[0]["content"])
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "### 新标题",
+                            }
+                        }
+                    )
                 return json.dumps({"modified_10": "### 新标题\n\n新内容"})
 
         ai_client = FakeAIClient()
@@ -1248,7 +2429,10 @@ class FileUpdaterRegressionTest(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        self.assertEqual(updated_sections["modified_10"], "### 新标题\n\n新内容")
+        self.assertEqual(
+            updated_sections["modified_10"],
+            "### 新标题 {#new-heading}\n\n新内容",
+        )
         self.assertIn("### New heading", ai_client.prompts[0])
         self.assertIn("New content", ai_client.prompts[0])
         self.assertIn("after applying the diff", ai_client.prompts[0])
@@ -1263,7 +2447,17 @@ class FileUpdaterRegressionTest(unittest.TestCase):
                 self.prompts = []
 
             def chat_completion(self, messages, temperature=0.1):
-                self.prompts.append(messages[0]["content"])
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "Translate only the changed Markdown headings" in prompt:
+                    return json.dumps(
+                        {
+                            "heading_001": {
+                                "status": "updated",
+                                "heading": "### 新标题",
+                            }
+                        }
+                    )
                 return json.dumps({"modified_10": "### 新标题\n\n新内容"})
 
         ai_client = FakeAIClient()
@@ -1291,7 +2485,10 @@ class FileUpdaterRegressionTest(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        self.assertEqual(updated_sections["modified_10"], "### 新标题\n\n新内容")
+        self.assertEqual(
+            updated_sections["modified_10"],
+            "### 新标题 {#new-heading}\n\n新内容",
+        )
         self.assertIn("New heading", ai_client.prompts[0])
         self.assertIn("New content", ai_client.prompts[0])
         self.assertIn("post-change", ai_client.prompts[0])

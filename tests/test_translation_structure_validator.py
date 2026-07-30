@@ -8,7 +8,9 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from translation_structure_validator import (
     compare_custom_content_structure,
+    compare_expected_heading_anchors,
     compare_heading_structure,
+    compare_stable_heading_order,
     compact_heading_levels,
     extract_custom_content_tags,
     extract_heading_levels,
@@ -74,6 +76,67 @@ class TranslationStructureValidatorTest(unittest.TestCase):
         self.assertEqual("#x1 ##x1 ###x1", issue.source_compact)
         self.assertEqual("#x1 ##x2", issue.target_compact)
         self.assertEqual("heading 3: source ###, target ##", issue.first_difference)
+
+    def test_compare_stable_heading_order_reports_swapped_anchored_sections(self):
+        issue = compare_stable_heading_order(
+            "guide.md",
+            (
+                "# Guide\n\n"
+                "## Configure database audit logging settings\n\n"
+                "## Specify audit filter rules\n\n"
+                "## View audit logs\n"
+            ),
+            (
+                "# ガイド\n\n"
+                "## 監査フィルタルールを指定する {#specify-audit-filter-rules}\n\n"
+                "## データベース監査ログ設定を構成する "
+                "{#configure-database-audit-logging-settings}\n\n"
+                "## 監査ログを確認する {#view-audit-logs}\n"
+            ),
+        )
+
+        self.assertIsNotNone(issue)
+        self.assertEqual("stable heading relative order differs", issue.reason)
+        self.assertEqual(
+            "stable heading 1: source configure-database-audit-logging-settings, "
+            "target specify-audit-filter-rules",
+            issue.first_difference,
+        )
+
+    def test_compare_stable_heading_order_ignores_unanchored_translated_titles(self):
+        issue = compare_stable_heading_order(
+            "guide.md",
+            "# Guide\n\n## Configure\n\n## View logs\n",
+            "# ガイド\n\n## 構成する\n\n## ログを確認する\n",
+        )
+
+        self.assertIsNone(issue)
+
+    def test_compare_expected_heading_anchors_reports_missing_changed_anchor(self):
+        issue = compare_expected_heading_anchors(
+            "guide.md",
+            (
+                "# ガイド\n\n"
+                "## 監査フィルターイベント {#auditing-filter-events}\n"
+            ),
+            ["audit-filter-events"],
+        )
+
+        self.assertIsNotNone(issue)
+        self.assertEqual("expected heading anchors are missing", issue.reason)
+        self.assertEqual(
+            "expected anchor {#audit-filter-events} is missing from target",
+            issue.first_difference,
+        )
+
+    def test_compare_expected_heading_anchors_accepts_restored_anchor(self):
+        issue = compare_expected_heading_anchors(
+            "guide.md",
+            "## 監査フィルターイベント {#audit-filter-events}\n",
+            ["audit-filter-events"],
+        )
+
+        self.assertIsNone(issue)
 
     def test_extract_custom_content_tags_skips_code_blocks_and_keeps_inline_order(self):
         content = "\n".join(
@@ -171,6 +234,21 @@ class TranslationStructureValidatorTest(unittest.TestCase):
         )
 
         self.assertEqual(["CustomContent tag sequence differs"], [issue.reason for issue in issues])
+
+    def test_validate_markdown_heading_structures_checks_expected_anchors(self):
+        issues = validate_markdown_heading_structures(
+            ["guide.md"],
+            lambda _file_path: "# Guide\n\n## Audit filter events\n",
+            lambda _file_path: "# ガイド\n\n## 監査フィルターイベント\n",
+            expected_heading_anchors_loader=lambda _file_path: [
+                "audit-filter-events"
+            ],
+        )
+
+        self.assertEqual(
+            ["expected heading anchors are missing"],
+            [issue.reason for issue in issues],
+        )
 
     def test_validate_markdown_heading_structures_reports_loader_none_and_exceptions(self):
         def source_loader(file_path):

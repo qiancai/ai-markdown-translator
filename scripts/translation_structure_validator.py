@@ -1,9 +1,15 @@
 """Validate translated Markdown document structure against source HEAD."""
 
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import re
 from typing import Optional
+
+from heading_anchor_utils import (
+    EXPLICIT_HEADING_ANCHOR_RE,
+    build_heading_anchor_slug,
+)
 
 
 FENCE_RE = re.compile(r"^ {0,3}(```+|~~~+)")
@@ -120,6 +126,131 @@ def compare_heading_structure(file_path, source_content, target_content):
         source_compact=compact_heading_levels(source_levels),
         target_compact=compact_heading_levels(target_levels),
         first_difference=describe_first_difference(source_levels, target_levels),
+    )
+
+
+def extract_source_heading_identities(content):
+    """Return source heading identities from explicit or implied anchors."""
+    identities = []
+    for _, line in iter_markdown_content_lines(content):
+        heading_match = HEADING_RE.match(line)
+        if not heading_match or len(heading_match.group(1)) == 1:
+            continue
+
+        heading_text = heading_match.group(2).strip()
+        anchor_match = EXPLICIT_HEADING_ANCHOR_RE.search(heading_text)
+        identity = (
+            anchor_match.group(1).strip()
+            if anchor_match
+            else build_heading_anchor_slug(heading_text)
+        )
+        if identity:
+            identities.append(identity)
+    return identities
+
+
+def extract_explicit_heading_identities(content):
+    """Return explicit non-top-level heading anchors in document order."""
+    identities = []
+    for _, line in iter_markdown_content_lines(content):
+        heading_match = HEADING_RE.match(line)
+        if not heading_match or len(heading_match.group(1)) == 1:
+            continue
+
+        anchor_match = EXPLICIT_HEADING_ANCHOR_RE.search(
+            heading_match.group(2).strip()
+        )
+        if anchor_match:
+            identities.append(anchor_match.group(1).strip())
+    return identities
+
+
+def _compact_heading_identities(identities, limit=8):
+    shown = list(identities[:limit])
+    if len(identities) > limit:
+        shown.append(f"... (+{len(identities) - limit} more)")
+    return " -> ".join(shown) if shown else "(no stable headings)"
+
+
+def compare_stable_heading_order(file_path, source_content, target_content):
+    """Check the relative order of unambiguous anchors shared by both files.
+
+    Source English headings have deterministic implied anchors. Translated
+    headings are used only when they retain an explicit source-language anchor,
+    so translated title text never participates in identity matching.
+    """
+    source_identities = extract_source_heading_identities(source_content)
+    target_identities = extract_explicit_heading_identities(target_content)
+    source_counts = Counter(source_identities)
+    target_counts = Counter(target_identities)
+    shared_unique = {
+        identity
+        for identity in source_counts.keys() & target_counts.keys()
+        if source_counts[identity] == 1 and target_counts[identity] == 1
+    }
+
+    if len(shared_unique) < 2:
+        return None
+
+    source_order = [
+        identity for identity in source_identities if identity in shared_unique
+    ]
+    target_order = [
+        identity for identity in target_identities if identity in shared_unique
+    ]
+    if source_order == target_order:
+        return None
+
+    first_difference = ""
+    for index, (source_identity, target_identity) in enumerate(
+        zip(source_order, target_order),
+        1,
+    ):
+        if source_identity != target_identity:
+            first_difference = (
+                f"stable heading {index}: source {source_identity}, "
+                f"target {target_identity}"
+            )
+            break
+
+    return StructureValidationIssue(
+        file_path=file_path,
+        reason="stable heading relative order differs",
+        source_compact=_compact_heading_identities(source_order),
+        target_compact=_compact_heading_identities(target_order),
+        first_difference=first_difference,
+    )
+
+
+def compare_expected_heading_anchors(
+    file_path,
+    target_content,
+    expected_anchors,
+):
+    """Report prompt-time changed-heading anchors missing from the target."""
+    expected = [anchor for anchor in (expected_anchors or []) if anchor]
+    if not expected:
+        return None
+
+    target_anchors = extract_explicit_heading_identities(target_content)
+    remaining = Counter(target_anchors)
+    missing = []
+    for anchor in expected:
+        if remaining[anchor] > 0:
+            remaining[anchor] -= 1
+        else:
+            missing.append(anchor)
+
+    if not missing:
+        return None
+
+    first_missing = missing[0]
+    return StructureValidationIssue(
+        file_path=file_path,
+        reason="expected heading anchors are missing",
+        source_compact=_compact_heading_identities(expected),
+        target_compact=_compact_heading_identities(target_anchors),
+        first_difference=f"expected anchor {{#{first_missing}}} is missing from target",
     )
 
 
@@ -363,6 +494,9 @@ def validate_markdown_heading_structures(
     file_paths: Iterable[str],
     source_content_loader: Callable[[str], Optional[str]],
     target_content_loader: Callable[[str], Optional[str]],
+    expected_heading_anchors_loader: Optional[
+        Callable[[str], Iterable[str]]
+    ] = None,
 ):
     """Validate Markdown heading levels and CustomContent tags."""
     issues = []
@@ -411,8 +545,28 @@ def validate_markdown_heading_structures(
             )
             continue
 
+        expected_anchor_issue = None
+        if expected_heading_anchors_loader:
+            try:
+                expected_anchors = expected_heading_anchors_loader(file_path)
+            except Exception as exc:
+                issues.append(
+                    StructureValidationIssue(
+                        file_path=file_path,
+                        reason=f"could not determine expected heading anchors: {exc}",
+                    )
+                )
+                expected_anchors = []
+            expected_anchor_issue = compare_expected_heading_anchors(
+                file_path,
+                target_content,
+                expected_anchors,
+            )
+
         for issue in (
             compare_heading_structure(file_path, source_content, target_content),
+            compare_stable_heading_order(file_path, source_content, target_content),
+            expected_anchor_issue,
             compare_custom_content_structure(file_path, source_content, target_content),
         ):
             if issue:

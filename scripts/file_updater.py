@@ -13,6 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from github import Github
 from openai import OpenAI
 from file_io import atomic_write_text
+from heading_anchor_utils import (
+    EXPLICIT_HEADING_ANCHOR_RE,
+    build_heading_anchor_slug,
+)
 from log_sanitizer import sanitize_exception_message, safe_target_path
 from product_specific_handler import rewrite_tidb_version_anchors_in_sections
 from special_file_utils import path_resource_key, source_scope_includes_folder
@@ -92,7 +96,6 @@ def is_markdown_heading(line):
     return re.match(r'^#{1,10}\s+\S', line) is not None
 
 
-EXPLICIT_HEADING_ANCHOR_RE = re.compile(r'\s+\{#([^}]+)\}\s*$')
 NON_TOP_LEVEL_HEADING_RE = re.compile(r'^(#{2,10})\s+(.+?)\s*$')
 DOC_VARIABLE_EXAMPLE = "{{{ .starter }}}"
 ALIASES_LINE_RE = re.compile(r'^(?P<prefix>\+?)(?P<indent>\s*)aliases:(?P<spacing>\s*)(?P<value>.+?)\s*$')
@@ -126,25 +129,6 @@ def has_explicit_heading_anchor(heading_line):
     if not heading_line:
         return False
     return EXPLICIT_HEADING_ANCHOR_RE.search(heading_line.strip()) is not None
-
-
-def build_heading_anchor_slug(heading_text):
-    """Build a stable slug for an English markdown heading."""
-    if not heading_text:
-        return ""
-
-    text = EXPLICIT_HEADING_ANCHOR_RE.sub("", heading_text.strip())
-    text = re.sub(r'`([^`]*)`', r'\1', text)
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-    # Ignore HTML tags themselves while preserving their visible text content.
-    text = re.sub(r'</?[^>]+>', ' ', text)
-    # Keep dotted version numbers compact in anchors, e.g. v4.0.10 -> v4010.
-    text = re.sub(r'(?<=\d)\.(?=\d)', '', text)
-    text = text.lower()
-    text = re.sub(r'[^a-z0-9\s-]', ' ', text)
-    text = re.sub(r'\s+', '-', text.strip())
-    text = re.sub(r'-+', '-', text)
-    return text.strip('-')
 
 
 def add_heading_anchor_if_needed(heading_line):
@@ -317,7 +301,34 @@ def preprocess_tidb_cloud_links_in_line(line, diff_added_only=False):
     return TIDB_CLOUD_LINK_RE.sub(repl, line)
 
 
-def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, target_language, source_mode=""):
+def _extract_source_section_heading_lines(source_sections):
+    """Return exact real heading lines found outside source-section fences."""
+    heading_lines = set()
+    for content in (source_sections or {}).values():
+        in_code_block = False
+        code_block_delimiter = None
+        for line in str(content or "").splitlines():
+            fence_marker = _get_fence_marker(line)
+            if fence_marker:
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_delimiter = fence_marker
+                elif line.strip().startswith(code_block_delimiter):
+                    in_code_block = False
+                    code_block_delimiter = None
+                continue
+            if not in_code_block and is_markdown_heading(line):
+                heading_lines.add(line.rstrip())
+    return heading_lines
+
+
+def preprocess_diff_for_heading_anchor_stability(
+    pr_diff,
+    source_language,
+    target_language,
+    source_mode="",
+    source_sections=None,
+):
     """Add prompt-only stability tweaks for commit-based English -> non-English translation."""
     if not pr_diff:
         return pr_diff
@@ -340,6 +351,17 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
         return pr_diff
 
     lang_prefix = get_language_alias_prefix(target_language)
+    source_heading_lines = (
+        _extract_source_section_heading_lines(source_sections)
+        if source_sections is not None
+        else None
+    )
+
+    def source_confirms_heading(heading_line):
+        return (
+            source_heading_lines is None
+            or heading_line.rstrip() in source_heading_lines
+        )
 
     lines = pr_diff.splitlines()
     processed_lines = []
@@ -389,10 +411,19 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
                 if not buf_in_code_block:
                     added_slug = extract_heading_anchor_slug(added_heading)
 
-                    if removed_slug and added_slug and removed_slug != added_slug:
+                    if (
+                        removed_slug
+                        and added_slug
+                        and removed_slug != added_slug
+                        and source_confirms_heading(added_heading)
+                    ):
                         added_line = f"+{add_heading_anchor_if_needed(added_heading)}"
                         consumed_replacement = True
-                    elif added_slug and not removed_slug:
+                    elif (
+                        added_slug
+                        and not removed_slug
+                        and source_confirms_heading(added_heading)
+                    ):
                         added_line = f"+{add_heading_anchor_if_needed(added_heading)}"
 
                 # Apply aliases/links preprocessing to buffered + lines.
@@ -418,7 +449,11 @@ def preprocess_diff_for_heading_anchor_stability(pr_diff, source_language, targe
         if enable_commit_only_preprocessing:
             if not in_code_block and line.startswith('+') and not line.startswith('+++'):
                 content = line[1:]
-                processed_content = add_heading_anchor_if_needed(content)
+                processed_content = (
+                    add_heading_anchor_if_needed(content)
+                    if source_confirms_heading(content)
+                    else content
+                )
                 if processed_content != content:
                     line = f"+{processed_content}"
             line = preprocess_aliases_line(line, lang_prefix, diff_added_only=True)
@@ -434,6 +469,1003 @@ def _get_fence_marker(line):
     """Return a markdown fence marker (``` or ~~~) if the line opens/closes a code block."""
     match = re.match(r'^(`{3,}|~{3,})', (line or "").strip())
     return match.group(1) if match else None
+
+
+def _iter_changed_diff_lines_outside_fences(pr_diff, change_prefix):
+    """Yield one diff side's changed lines while tracking that side's fences."""
+    opposite_prefix = "-" if change_prefix == "+" else "+"
+    in_code_block = False
+    code_block_delimiter = None
+
+    for line in (pr_diff or "").splitlines():
+        if line.startswith("@@"):
+            # A hunk does not expose Markdown parser state before its first
+            # context line. Reset here so an unclosed fence in one hunk cannot
+            # incorrectly affect a later, unrelated hunk.
+            in_code_block = False
+            code_block_delimiter = None
+            continue
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith(opposite_prefix):
+            continue
+
+        is_changed_line = line.startswith(change_prefix)
+        if is_changed_line:
+            content = line[1:]
+        elif line.startswith(" "):
+            content = line[1:]
+        else:
+            continue
+
+        fence_marker = _get_fence_marker(content)
+        if fence_marker:
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = fence_marker
+            elif content.strip().startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+            continue
+
+        if is_changed_line and not in_code_block:
+            yield content
+
+
+def extract_added_explicit_heading_anchors(pr_diff):
+    """Return explicit anchors from added non-H1 headings outside code fences."""
+    anchors = []
+    for content in _iter_changed_diff_lines_outside_fences(pr_diff, "+"):
+        heading_match = NON_TOP_LEVEL_HEADING_RE.match(content.rstrip())
+        if not heading_match:
+            continue
+        anchor_match = EXPLICIT_HEADING_ANCHOR_RE.search(content.rstrip())
+        if anchor_match:
+            anchors.append(anchor_match.group(1).strip())
+
+    return anchors
+
+
+def _prompt_heading_anchor_replacements(prompt_pr_diff):
+    """Map source heading lines to anchors added to the prompt diff."""
+    replacements = {}
+    for content in _iter_changed_diff_lines_outside_fences(
+        prompt_pr_diff,
+        "+",
+    ):
+        anchor_match = EXPLICIT_HEADING_ANCHOR_RE.search(content.rstrip())
+        if not anchor_match:
+            continue
+        heading_without_anchor = EXPLICIT_HEADING_ANCHOR_RE.sub(
+            "",
+            content.rstrip(),
+        ).rstrip()
+        if NON_TOP_LEVEL_HEADING_RE.match(heading_without_anchor):
+            replacements[heading_without_anchor] = anchor_match.group(1).strip()
+
+    return replacements
+
+
+def preprocess_source_sections_for_heading_anchor_stability(
+    source_sections,
+    prompt_pr_diff,
+):
+    """Apply the prompt diff's synthetic heading anchors to source sections."""
+    replacements = _prompt_heading_anchor_replacements(prompt_pr_diff)
+    if not replacements:
+        return dict(source_sections or {})
+
+    processed_sections = {}
+    for key, content in (source_sections or {}).items():
+        processed_lines = []
+        in_code_block = False
+        code_block_delimiter = None
+
+        for line in str(content or "").splitlines(keepends=True):
+            line_ending = ""
+            body = line
+            if body.endswith("\r\n"):
+                body, line_ending = body[:-2], "\r\n"
+            elif body.endswith("\n"):
+                body, line_ending = body[:-1], "\n"
+
+            fence_marker = _get_fence_marker(body)
+            if fence_marker:
+                if not in_code_block:
+                    in_code_block = True
+                    code_block_delimiter = fence_marker
+                elif body.strip().startswith(code_block_delimiter):
+                    in_code_block = False
+                    code_block_delimiter = None
+                processed_lines.append(line)
+                continue
+
+            if not in_code_block and not has_explicit_heading_anchor(body):
+                anchor = replacements.get(body.rstrip())
+                if anchor:
+                    body = f"{body.rstrip()} {{#{anchor}}}"
+
+            processed_lines.append(body + line_ending)
+
+        processed_sections[key] = "".join(processed_lines)
+
+    return processed_sections
+
+
+def _extract_section_headings(content):
+    """Return heading records outside code fences for one section."""
+    records = []
+    lines = str(content or "").splitlines(keepends=True)
+    in_code_block = False
+    code_block_delimiter = None
+
+    for line_index, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        fence_marker = _get_fence_marker(body)
+        if fence_marker:
+            if not in_code_block:
+                in_code_block = True
+                code_block_delimiter = fence_marker
+            elif body.strip().startswith(code_block_delimiter):
+                in_code_block = False
+                code_block_delimiter = None
+            continue
+
+        if in_code_block or not is_markdown_heading(body):
+            continue
+
+        heading_match = re.match(r"^(#{1,10})\s+(.+?)\s*$", body)
+        if not heading_match:
+            continue
+        anchor_match = EXPLICIT_HEADING_ANCHOR_RE.search(body)
+        records.append(
+            {
+                "line_index": line_index,
+                "level": len(heading_match.group(1)),
+                "title": EXPLICIT_HEADING_ANCHOR_RE.sub(
+                    "",
+                    heading_match.group(2).strip(),
+                ).strip(),
+                "anchor": anchor_match.group(1).strip() if anchor_match else "",
+            }
+        )
+
+    return lines, records
+
+
+def _parse_heading_line(heading_line):
+    """Parse one Markdown heading line without accepting surrounding content."""
+    if not isinstance(heading_line, str):
+        return None
+    stripped = heading_line.strip()
+    if not stripped or len(stripped.splitlines()) != 1:
+        return None
+
+    heading_match = re.match(r"^(#{1,10})\s+(.+?)\s*$", stripped)
+    if not heading_match:
+        return None
+    anchor_match = EXPLICIT_HEADING_ANCHOR_RE.search(stripped)
+    title = EXPLICIT_HEADING_ANCHOR_RE.sub(
+        "",
+        heading_match.group(2).strip(),
+    ).strip()
+    if not title:
+        return None
+
+    return {
+        "level": len(heading_match.group(1)),
+        "title": title,
+        "anchor": anchor_match.group(1).strip() if anchor_match else "",
+    }
+
+
+def _replace_heading_anchor(line, anchor):
+    """Set one heading's explicit anchor while preserving its line ending."""
+    line_ending = ""
+    body = line
+    if body.endswith("\r\n"):
+        body, line_ending = body[:-2], "\r\n"
+    elif body.endswith("\n"):
+        body, line_ending = body[:-1], "\n"
+    body = EXPLICIT_HEADING_ANCHOR_RE.sub("", body.rstrip()).rstrip()
+    return f"{body} {{#{anchor}}}{line_ending}"
+
+
+def _replace_heading_title(line, level, title, anchor):
+    """Replace a heading title while preserving its line ending and anchor."""
+    line_ending = ""
+    if line.endswith("\r\n"):
+        line_ending = "\r\n"
+    elif line.endswith("\n"):
+        line_ending = "\n"
+
+    anchor_suffix = f" {{#{anchor}}}" if anchor else ""
+    return f"{'#' * level} {title}{anchor_suffix}{line_ending}"
+
+
+def _heading_titles_equal(left, right):
+    """Compare heading titles while ignoring insignificant whitespace and case."""
+    def normalize(value):
+        return re.sub(
+            r"\s+",
+            " ",
+            str(value or "").strip(),
+        ).casefold()
+
+    return normalize(left) == normalize(right)
+
+
+def _extract_changed_heading_specs(pr_diff):
+    """Return added heading records and their paired removed headings."""
+    _, hunks = _parse_diff_hunks(pr_diff)
+    specs = []
+
+    for hunk in hunks:
+        header_match = _HUNK_HEADER_RE.match(hunk[0])
+        if not header_match:
+            continue
+        new_line_number = int(header_match.group(3))
+        pending_removed = []
+        old_fence = None
+        new_fence = None
+
+        def update_fence(current_fence, content):
+            marker = _get_fence_marker(content)
+            if not marker:
+                return current_fence
+            if current_fence is None:
+                return marker
+            if content.strip().startswith(current_fence):
+                return None
+            return current_fence
+
+        for raw_line in hunk[1:]:
+            if raw_line.startswith("\\"):
+                continue
+            prefix = raw_line[:1]
+            content = raw_line[1:].rstrip("\r\n")
+
+            if prefix == " ":
+                pending_removed = []
+                old_fence = update_fence(old_fence, content)
+                new_fence = update_fence(new_fence, content)
+                new_line_number += 1
+                continue
+
+            if prefix == "-":
+                fence_before = old_fence
+                old_fence = update_fence(old_fence, content)
+                if fence_before is None and _get_fence_marker(content) is None:
+                    heading = _parse_heading_line(content)
+                    if heading:
+                        pending_removed.append(heading)
+                continue
+
+            if prefix == "+":
+                fence_before = new_fence
+                new_fence = update_fence(new_fence, content)
+                if fence_before is None and _get_fence_marker(content) is None:
+                    heading = _parse_heading_line(content)
+                    if heading:
+                        old_heading = None
+                        for index, candidate in enumerate(pending_removed):
+                            if candidate["level"] == heading["level"]:
+                                old_heading = pending_removed.pop(index)
+                                break
+                        specs.append(
+                            {
+                                "old": old_heading,
+                                "new": heading,
+                                "new_line_number": new_line_number,
+                            }
+                        )
+                new_line_number += 1
+
+    return specs
+
+
+def _build_heading_translation_tasks(
+    source_sections,
+    target_sections,
+    updated_sections,
+    prompt_pr_diff,
+    source_language,
+    target_language,
+):
+    """Return only changed headings whose main translation needs repair."""
+    specs = [
+        spec
+        for spec in _extract_changed_heading_specs(prompt_pr_diff)
+        if not spec["old"]
+        or spec["old"]["title"] != spec["new"]["title"]
+    ]
+    if not specs:
+        return [], [], []
+
+    prompt_source_sections = preprocess_source_sections_for_heading_anchor_stability(
+        source_sections,
+        prompt_pr_diff,
+    )
+    locations = []
+    partial_reasons = []
+    updated_section_keys = set(updated_sections or {})
+    for key, source_content in prompt_source_sections.items():
+        # A heading retry may repair content inside a returned section, but it
+        # must never fabricate a section that the main response omitted.
+        if key not in updated_section_keys:
+            continue
+
+        source_lines, source_headings = _extract_section_headings(source_content)
+        target_content = (target_sections or {}).get(key, "")
+        output_content = (updated_sections or {}).get(key, "")
+        _, target_headings = _extract_section_headings(target_content)
+        _, output_headings = _extract_section_headings(output_content)
+
+        source_levels = [heading["level"] for heading in source_headings]
+        target_levels = [heading["level"] for heading in target_headings]
+        output_levels = [heading["level"] for heading in output_headings]
+        if len(source_headings) > 1 and (
+            source_levels != output_levels
+            or (target_content and source_levels != target_levels)
+        ):
+            partial_reasons.append(
+                "changed heading repair is ambiguous for multi-heading "
+                f"section {key}; preserving the main translation output"
+            )
+            continue
+
+        source_heading_line_indexes = {
+            heading["line_index"] for heading in source_headings
+        }
+        source_has_non_heading_content = any(
+            line.strip()
+            for line_index, line in enumerate(source_lines)
+            if line_index not in source_heading_line_indexes
+        )
+        key_line_number = _extract_line_number_from_key(key)
+        for ordinal, source_heading in enumerate(source_headings):
+            locations.append(
+                {
+                    "key": key,
+                    "ordinal": ordinal,
+                    "key_line_number": key_line_number,
+                    "source": source_heading,
+                    "source_has_nonblank_prefix": any(
+                        line.strip()
+                        for line in source_lines[:source_heading["line_index"]]
+                    ),
+                    "source_has_non_heading_content": (
+                        source_has_non_heading_content
+                    ),
+                    "target": (
+                        target_headings[ordinal]
+                        if ordinal < len(target_headings)
+                        else None
+                    ),
+                    "output": (
+                        output_headings[ordinal]
+                        if ordinal < len(output_headings)
+                        else None
+                    ),
+                }
+            )
+
+    mapped_headings = []
+    tasks = []
+    used_locations = set()
+    for spec in specs:
+        source_contains_heading = any(
+            location["source"]["level"] == spec["new"]["level"]
+            and location["source"]["title"] == spec["new"]["title"]
+            for location in locations
+        )
+        if not source_contains_heading:
+            # Chunk filtering works at hunk granularity, so one chunk can see
+            # changed headings that belong to source sections in another chunk.
+            continue
+
+        matching_locations = []
+        for location_index, location in enumerate(locations):
+            if location_index in used_locations:
+                continue
+            source_heading = location["source"]
+            if (
+                source_heading["level"] != spec["new"]["level"]
+                or source_heading["title"] != spec["new"]["title"]
+            ):
+                continue
+
+            exact_line_match = (
+                location["key_line_number"] == spec["new_line_number"]
+            )
+            intro_h1_match = (
+                location["key"] == "intro_section"
+                and spec["new"]["level"] == 1
+                and location["ordinal"] == 0
+            )
+            distance = (
+                abs(location["key_line_number"] - spec["new_line_number"])
+                if location["key_line_number"] is not None
+                else 999999
+            )
+            matching_locations.append(
+                (
+                    0 if exact_line_match else 1,
+                    0 if intro_h1_match else 1,
+                    0 if location["ordinal"] == 0 else 1,
+                    distance,
+                    location_index,
+                    location,
+                )
+            )
+
+        if not matching_locations:
+            partial_reasons.append(
+                "changed heading could not be mapped to a source section: "
+                f"{'#' * spec['new']['level']} {spec['new']['title']}"
+            )
+            continue
+
+        *_, location_index, location = min(matching_locations)
+        used_locations.add(location_index)
+        output_heading = location["output"]
+        target_heading = location["target"]
+        expected_anchor = (
+            spec["new"]["anchor"]
+            or location["source"]["anchor"]
+            or (target_heading["anchor"] if target_heading else "")
+            or (output_heading["anchor"] if output_heading else "")
+        )
+        record = {
+            "key": location["key"],
+            "ordinal": location["ordinal"],
+            "level": spec["new"]["level"],
+            "old_source_title": (
+                spec["old"]["title"] if spec["old"] else ""
+            ),
+            "new_source_title": spec["new"]["title"],
+            "old_target_title": (
+                target_heading["title"] if target_heading else ""
+            ),
+            "main_output_title": (
+                output_heading["title"] if output_heading else ""
+            ),
+            "main_output_level": (
+                output_heading["level"] if output_heading else None
+            ),
+            "source_has_nonblank_prefix": (
+                location["source_has_nonblank_prefix"]
+            ),
+            "source_has_non_heading_content": (
+                location["source_has_non_heading_content"]
+            ),
+            "expected_anchor": expected_anchor,
+        }
+        mapped_headings.append(record)
+
+        repair_reason = ""
+        if not output_heading:
+            repair_reason = "missing"
+        elif output_heading["level"] != spec["new"]["level"]:
+            repair_reason = "wrong_level"
+        elif (
+            record["old_target_title"]
+            and _heading_titles_equal(
+                record["main_output_title"],
+                record["old_target_title"],
+            )
+        ):
+            repair_reason = "unchanged"
+        elif (
+            source_language.casefold() != target_language.casefold()
+            and any(
+                _heading_titles_equal(
+                    record["main_output_title"],
+                    source_title,
+                )
+                for source_title in (
+                    record["old_source_title"],
+                    record["new_source_title"],
+                )
+                if source_title
+            )
+        ):
+            repair_reason = "source_language"
+
+        if repair_reason:
+            record = dict(record)
+            record["id"] = f"heading_{len(tasks) + 1:03d}"
+            record["repair_reason"] = repair_reason
+            tasks.append(record)
+
+    return tasks, mapped_headings, partial_reasons
+
+
+def _build_heading_translation_prompt(
+    tasks,
+    source_language,
+    target_language,
+    glossary_matcher=None,
+):
+    """Build a small prompt containing only changed heading translations."""
+    payload = {}
+    for task in tasks:
+        level_prefix = "#" * task["level"]
+        payload[task["id"]] = {
+            "old_source_heading": (
+                f"{level_prefix} {task['old_source_title']}"
+                if task["old_source_title"]
+                else None
+            ),
+            "new_source_heading": (
+                f"{level_prefix} {task['new_source_title']}"
+            ),
+            "old_target_heading": (
+                f"{level_prefix} {task['old_target_title']}"
+                if task["old_target_title"]
+                else None
+            ),
+            "main_output_heading": (
+                f"{'#' * task['main_output_level']} "
+                f"{task['main_output_title']}"
+                if task["main_output_title"]
+                and task["main_output_level"]
+                else None
+            ),
+            "repair_reason": task["repair_reason"],
+        }
+
+    glossary_text = ""
+    if glossary_matcher:
+        from glossary import filter_terms_for_content, format_terms_for_prompt
+        matched_terms = filter_terms_for_content(
+            glossary_matcher,
+            json.dumps(payload, ensure_ascii=False),
+            source_language=source_language,
+        )
+        if matched_terms:
+            glossary_text = (
+                "\n"
+                + format_terms_for_prompt(
+                    matched_terms,
+                    source_language=source_language,
+                    target_language=target_language,
+                )
+                + "\n"
+            )
+
+    prompt = f"""Translate only the changed Markdown headings from {source_language} to {target_language} that the main translation left suspicious.
+
+For a renamed heading, use the old source and target headings to preserve the established target-language style while applying every semantic change in the new source heading.
+For a newly added heading, translate the new source heading naturally into {target_language}.
+
+Rules:
+- Return a JSON object with exactly the same keys as the input.
+- Each value must be an object with exactly two fields:
+  - `status`: `updated` or `already_equivalent`
+  - `heading`: exactly one Markdown heading line with the same number of `#` characters as the new source heading
+- Use `updated` when the heading needs a new target-language translation.
+- Use `already_equivalent` only when `main_output_heading` is already correct and should remain unchanged. This includes an established target translation that still fully expresses the renamed source heading, and headings made entirely of product names, API names, code identifiers, configuration keys, or other technical text that must remain identical to the source language.
+- Return no body text, explanation, code fence, or additional line.
+- Do not add or change explicit heading anchors. The program restores anchors separately.
+- Preserve inline Markdown, HTML/MDX tags, and placeholders exactly.
+- Preserve technical product names and follow the glossary when present.
+
+Input:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+{glossary_text}
+Return only the JSON object."""
+    return prompt
+
+
+def _apply_targeted_heading(repaired, task, translated_title):
+    """Apply one validated heading title, inserting a missing first heading."""
+    key = task["key"]
+    content = repaired.get(key, "")
+    output_lines, output_headings = _extract_section_headings(content)
+
+    if task["repair_reason"] == "missing":
+        if (
+            task["ordinal"] != 0
+            or task["source_has_nonblank_prefix"]
+            or (
+                not content.strip()
+                and task["source_has_non_heading_content"]
+            )
+        ):
+            return False
+
+        line_ending = "\r\n" if "\r\n" in content else "\n"
+        anchor_suffix = (
+            f" {{#{task['expected_anchor']}}}"
+            if task["expected_anchor"]
+            else ""
+        )
+        heading_line = (
+            f"{'#' * task['level']} {translated_title}"
+            f"{anchor_suffix}{line_ending}"
+        )
+        if not content:
+            repaired[key] = heading_line
+        elif content.startswith(("\n", "\r\n")):
+            repaired[key] = heading_line + content
+        else:
+            repaired[key] = heading_line + line_ending + content
+        return True
+
+    if task["ordinal"] < len(output_headings):
+        output_heading = output_headings[task["ordinal"]]
+        output_lines[output_heading["line_index"]] = _replace_heading_title(
+            output_lines[output_heading["line_index"]],
+            task["level"],
+            translated_title,
+            task["expected_anchor"],
+        )
+        repaired[key] = "".join(output_lines)
+        return True
+
+    return False
+
+
+def translate_changed_headings_with_ai(
+    source_sections,
+    target_sections,
+    updated_sections,
+    prompt_pr_diff,
+    ai_client,
+    source_language,
+    target_language,
+    target_file_prefix,
+    prompt_suffix,
+    glossary_matcher=None,
+):
+    """Retry only suspicious changed headings and splice validated titles back."""
+    tasks, mapped_headings, partial_reasons = _build_heading_translation_tasks(
+        source_sections,
+        target_sections,
+        updated_sections,
+        prompt_pr_diff,
+        source_language,
+        target_language,
+    )
+    repaired = dict(updated_sections or {})
+    already_equivalent_keys = set()
+    unresolved_missing_keys = {
+        task["key"]
+        for task in tasks
+        if task["repair_reason"] == "missing"
+    }
+
+    def preserve_unresolved_missing_sections():
+        """Avoid writing heading-less or heading-only content after a failed repair."""
+        for key in unresolved_missing_keys:
+            original_target = (target_sections or {}).get(key, "")
+            if original_target:
+                repaired[key] = original_target
+            else:
+                repaired.pop(key, None)
+
+    # Anchor ownership remains programmatic even when the targeted AI request
+    # is unnecessary, fails, or returns an unusable title.
+    for record in mapped_headings:
+        output_lines, output_headings = _extract_section_headings(
+            repaired.get(record["key"], "")
+        )
+        if record["ordinal"] >= len(output_headings):
+            continue
+        output_heading = output_headings[record["ordinal"]]
+        output_lines[output_heading["line_index"]] = _replace_heading_title(
+            output_lines[output_heading["line_index"]],
+            output_heading["level"],
+            output_heading["title"],
+            record["expected_anchor"],
+        )
+        repaired[record["key"]] = "".join(output_lines)
+
+    if not tasks:
+        return repaired, partial_reasons, already_equivalent_keys
+
+    prompt = _build_heading_translation_prompt(
+        tasks,
+        source_language,
+        target_language,
+        glossary_matcher=glossary_matcher,
+    )
+    temp_dir = get_temp_output_dir()
+    prompt_file = os.path.join(
+        temp_dir,
+        f"{target_file_prefix}_prompt-for-ai-heading-translation"
+        f"{prompt_suffix}.txt",
+    )
+    with open(prompt_file, "w", encoding="utf-8") as file:
+        file.write(prompt)
+    thread_safe_print(
+        f"   🔤 Translating {len(tasks)} changed heading(s) separately..."
+    )
+
+    try:
+        ai_response = ai_client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        response = parse_updated_sections(ai_response)
+    except Exception as error:
+        reason = sanitize_exception_message(error)
+        partial_reasons.append(
+            f"targeted heading translation failed: {reason}"
+        )
+        preserve_unresolved_missing_sections()
+        return repaired, partial_reasons, already_equivalent_keys
+
+    if not isinstance(response, dict):
+        partial_reasons.append(
+            "targeted heading translation did not return a JSON object"
+        )
+        preserve_unresolved_missing_sections()
+        return repaired, partial_reasons, already_equivalent_keys
+
+    expected_task_ids = {task["id"] for task in tasks}
+    unexpected_task_ids = sorted(set(response) - expected_task_ids)
+    if unexpected_task_ids:
+        partial_reasons.append(
+            "targeted heading translation returned unexpected keys: "
+            + ", ".join(unexpected_task_ids)
+        )
+
+    for task in tasks:
+        task_id = task["id"]
+        if task_id not in response:
+            partial_reasons.append(
+                f"targeted heading translation missing result for "
+                f"{task['key']} ({task_id})"
+            )
+            continue
+
+        task_result = response[task_id]
+        if not isinstance(task_result, dict):
+            partial_reasons.append(
+                f"targeted heading translation returned invalid result for "
+                f"{task['key']} ({task_id})"
+            )
+            continue
+        if set(task_result) != {"status", "heading"}:
+            partial_reasons.append(
+                f"targeted heading translation returned invalid fields for "
+                f"{task['key']} ({task_id})"
+            )
+            continue
+
+        status = task_result.get("status")
+        if status not in {"updated", "already_equivalent"}:
+            partial_reasons.append(
+                f"targeted heading translation returned invalid status for "
+                f"{task['key']} ({task_id})"
+            )
+            continue
+
+        translated_heading = _parse_heading_line(task_result.get("heading"))
+        if not translated_heading:
+            partial_reasons.append(
+                f"targeted heading translation returned invalid Markdown for "
+                f"{task['key']} ({task_id})"
+            )
+            continue
+        if translated_heading["level"] != task["level"]:
+            partial_reasons.append(
+                f"targeted heading translation changed heading level for "
+                f"{task['key']} ({task_id})"
+            )
+            continue
+
+        if status == "already_equivalent":
+            if (
+                not task["main_output_title"]
+                or not _heading_titles_equal(
+                    translated_heading["title"],
+                    task["main_output_title"],
+                )
+            ):
+                partial_reasons.append(
+                    f"targeted heading translation made an invalid "
+                    f"already_equivalent claim for {task['key']} ({task_id})"
+                )
+                continue
+        else:
+            if (
+                task["old_target_title"]
+                and _heading_titles_equal(
+                    translated_heading["title"],
+                    task["old_target_title"],
+                )
+            ):
+                partial_reasons.append(
+                    f"targeted heading translation stayed unchanged for "
+                    f"{task['key']} ({task_id})"
+                )
+                continue
+            if (
+                source_language.casefold() != target_language.casefold()
+                and any(
+                    _heading_titles_equal(
+                        translated_heading["title"],
+                        source_title,
+                    )
+                    for source_title in (
+                        task["old_source_title"],
+                        task["new_source_title"],
+                    )
+                    if source_title
+                )
+            ):
+                partial_reasons.append(
+                    f"targeted translation left heading in the source language "
+                    f"for {task['key']} ({task_id})"
+                )
+                continue
+
+        if not _apply_targeted_heading(
+            repaired,
+            task,
+            translated_heading["title"],
+        ):
+            partial_reasons.append(
+                f"targeted heading translation could not be applied for "
+                f"{task['key']} ({task_id})"
+            )
+            continue
+
+        unresolved_missing_keys.discard(task["key"])
+
+        # This exemption is consumed only by the modified-H1 completeness
+        # check, so a non-H1 result must never suppress an H1 failure.
+        if status == "already_equivalent" and task["level"] == 1:
+            already_equivalent_keys.add(task["key"])
+
+    preserve_unresolved_missing_sections()
+
+    if getattr(ai_response, "completion_status", "complete") == "incomplete":
+        partial_reasons.append(
+            "targeted heading translation response incomplete: "
+            + (
+                getattr(ai_response, "completion_reason", "")
+                or "unknown reason"
+            )
+        )
+
+    results_file = os.path.join(
+        temp_dir,
+        f"{target_file_prefix}_updated_headings_from_ai{prompt_suffix}.json",
+    )
+    with open(results_file, "w", encoding="utf-8") as file:
+        json.dump(response, file, ensure_ascii=False, indent=2)
+
+    return repaired, partial_reasons, already_equivalent_keys
+
+
+def restore_expected_heading_anchors(
+    source_sections,
+    updated_sections,
+    prompt_pr_diff,
+):
+    """Restore changed-heading anchors deterministically after AI translation."""
+    prompt_source_sections = preprocess_source_sections_for_heading_anchor_stability(
+        source_sections,
+        prompt_pr_diff,
+    )
+    expected_replacements = _prompt_heading_anchor_replacements(prompt_pr_diff)
+    if not expected_replacements:
+        return dict(updated_sections or {}), []
+
+    restored = dict(updated_sections or {})
+    partial_reasons = []
+    for key, source_content in prompt_source_sections.items():
+        if key not in restored:
+            continue
+
+        _, source_headings = _extract_section_headings(source_content)
+        expected_headings = []
+        for ordinal, heading in enumerate(source_headings):
+            source_heading_without_anchor = (
+                f"{'#' * heading['level']} {heading['title']}"
+            )
+            expected_anchor = expected_replacements.get(
+                source_heading_without_anchor
+            )
+            if expected_anchor:
+                expected_headings.append(
+                    (ordinal, heading["level"], expected_anchor)
+                )
+
+        if not expected_headings:
+            continue
+
+        output_lines, output_headings = _extract_section_headings(restored[key])
+        for ordinal, expected_level, expected_anchor in expected_headings:
+            if ordinal >= len(output_headings):
+                partial_reasons.append(
+                    f"changed heading missing from AI output for {key}: "
+                    f"expected anchor {{#{expected_anchor}}}"
+                )
+                continue
+
+            output_heading = output_headings[ordinal]
+            if output_heading["level"] != expected_level:
+                partial_reasons.append(
+                    f"changed heading level differs for {key}: "
+                    f"expected {'#' * expected_level} with anchor "
+                    f"{{#{expected_anchor}}}"
+                )
+                continue
+
+            output_lines[output_heading["line_index"]] = _replace_heading_anchor(
+                output_lines[output_heading["line_index"]],
+                expected_anchor,
+            )
+
+        restored[key] = "".join(output_lines)
+
+    return restored, partial_reasons
+
+
+def _modified_h1_titles_from_diff(pr_diff):
+    """Return H1 titles whose source title text actually changed."""
+    return [
+        spec["new"]["title"]
+        for spec in _extract_changed_heading_specs(pr_diff)
+        if (
+            spec["old"]
+            and spec["old"]["level"] == 1
+            and spec["new"]["level"] == 1
+            and spec["old"]["title"] != spec["new"]["title"]
+        )
+    ]
+
+
+def find_unapplied_modified_h1_sections(
+    source_sections,
+    target_sections,
+    updated_sections,
+    prompt_pr_diff,
+    already_equivalent_keys=None,
+):
+    """Report modified H1 sections whose translated heading stayed unchanged."""
+    modified_h1_titles = set(_modified_h1_titles_from_diff(prompt_pr_diff))
+    if not modified_h1_titles:
+        return []
+
+    equivalent_keys = set(already_equivalent_keys or ())
+    partial_reasons = []
+    for key, source_content in (source_sections or {}).items():
+        if key in equivalent_keys:
+            continue
+        _, source_headings = _extract_section_headings(source_content)
+        if not source_headings or source_headings[0]["level"] != 1:
+            continue
+        if source_headings[0]["title"] not in modified_h1_titles:
+            continue
+
+        _, target_headings = _extract_section_headings(
+            (target_sections or {}).get(key, "")
+        )
+        _, updated_headings = _extract_section_headings(
+            (updated_sections or {}).get(key, "")
+        )
+        old_h1 = (
+            target_headings[0]["title"]
+            if target_headings and target_headings[0]["level"] == 1
+            else ""
+        )
+        new_h1 = (
+            updated_headings[0]["title"]
+            if updated_headings and updated_headings[0]["level"] == 1
+            else ""
+        )
+        if old_h1 and (not new_h1 or new_h1 == old_h1):
+            partial_reasons.append(
+                f"changed source H1 produced an unchanged target H1 for {key}"
+            )
+
+    return partial_reasons
 
 def _heading_match_candidates(target_hierarchy):
     """Return full-path and leaf heading candidates for section-start matching."""
@@ -809,33 +1841,77 @@ def filter_diff_for_chunk_sections(pr_diff, chunk_keys, all_section_keys):
     if not pr_diff or not chunk_keys:
         return pr_diff or ""
 
-    chunk_line_numbers = sorted(
-        n for n in (_extract_line_number_from_key(k) for k in chunk_keys) if n is not None
-    )
-    if not chunk_line_numbers:
+    prefix_section_keys = {"frontmatter", "intro_section"}
+    chunk_keys_by_line = {}
+    for key in chunk_keys:
+        line_number = _extract_line_number_from_key(key)
+        if line_number is not None:
+            chunk_keys_by_line.setdefault(line_number, []).append(key)
+    chunk_line_numbers = sorted(chunk_keys_by_line)
+    chunk_prefix_keys = [
+        key for key in chunk_keys if key in prefix_section_keys
+    ]
+    if not chunk_line_numbers and not chunk_prefix_keys:
         return pr_diff
 
-    all_line_numbers = sorted(
+    all_line_numbers = sorted({
         n for n in (_extract_line_number_from_key(k) for k in all_section_keys) if n is not None
-    )
+    })
 
-    chunk_ranges = []
-    for ln in chunk_line_numbers:
-        idx = all_line_numbers.index(ln)
-        end = all_line_numbers[idx + 1] - 1 if idx + 1 < len(all_line_numbers) else 999999
-        chunk_ranges.append((ln, end))
+    section_ranges = {}
+    if chunk_prefix_keys:
+        prefix_end = (
+            min(all_line_numbers) - 1
+            if all_line_numbers
+            else 999999
+        )
+        for key in chunk_prefix_keys:
+            section_ranges[key] = (1, max(1, prefix_end))
+
+    all_line_indexes = {
+        line_number: index
+        for index, line_number in enumerate(all_line_numbers)
+    }
+    for line_number, keys in chunk_keys_by_line.items():
+        index = all_line_indexes[line_number]
+        end = (
+            all_line_numbers[index + 1] - 1
+            if index + 1 < len(all_line_numbers)
+            else 999999
+        )
+        for key in keys:
+            section_ranges[key] = (line_number, end)
 
     header, hunks = _parse_diff_hunks(pr_diff)
     relevant = []
+    covered_section_keys = set()
     for hunk in hunks:
         h_start, h_end = _hunk_new_line_range(hunk[0])
         if h_start is None:
             relevant.append(hunk)
             continue
-        for r_start, r_end in chunk_ranges:
+        hunk_is_relevant = False
+        for key, (r_start, r_end) in section_ranges.items():
             if h_start <= r_end and h_end >= r_start:
-                relevant.append(hunk)
-                break
+                covered_section_keys.add(key)
+                hunk_is_relevant = True
+        if hunk_is_relevant:
+            relevant.append(hunk)
+
+    required_modified_keys = {
+        key
+        for key in chunk_keys
+        if key in prefix_section_keys or key.startswith("modified_")
+    }
+    uncovered_modified_keys = sorted(
+        required_modified_keys - covered_section_keys
+    )
+    if uncovered_modified_keys:
+        thread_safe_print(
+            "   ⚠️  Chunk diff coverage is incomplete for modified section(s): "
+            f"{', '.join(uncovered_modified_keys)}; using the full file diff"
+        )
+        return pr_diff
 
     if not relevant:
         return header.rstrip("\n")
@@ -852,12 +1928,6 @@ def _prepare_translation_prompt(
     Returns (prompt, prompt_pr_diff) so callers can reuse the preprocessed diff
     for enforce_minimal_target_updates.
     """
-    formatted_source_sections = json.dumps(source_sections, ensure_ascii=False, indent=2)
-    formatted_target_sections = json.dumps(target_sections, ensure_ascii=False, indent=2)
-    source_sections_heading = (
-        f"1. Source sections in {source_language} (post-change, i.e. after applying the diff):"
-    )
-
     thread_safe_print(f"   📊 Source sections: {len(source_sections)} sections")
     thread_safe_print(f"   📊 Target sections: {len(target_sections)} sections")
 
@@ -868,7 +1938,28 @@ def _prepare_translation_prompt(
     thread_safe_print(f"   🤖 Getting AI translation for {len(source_sections)} sections...")
 
     prompt_pr_diff = preprocess_diff_for_heading_anchor_stability(
-        pr_diff, source_language, target_language, source_mode=source_mode
+        pr_diff,
+        source_language,
+        target_language,
+        source_mode=source_mode,
+        source_sections=source_sections,
+    )
+    prompt_source_sections = preprocess_source_sections_for_heading_anchor_stability(
+        source_sections,
+        prompt_pr_diff,
+    )
+    formatted_source_sections = json.dumps(
+        prompt_source_sections,
+        ensure_ascii=False,
+        indent=2,
+    )
+    formatted_target_sections = json.dumps(
+        target_sections,
+        ensure_ascii=False,
+        indent=2,
+    )
+    source_sections_heading = (
+        f"1. Source sections in {source_language} (post-change, i.e. after applying the diff):"
     )
 
     glossary_prompt_section = ""
@@ -985,9 +2076,10 @@ Please return the complete updated JSON in the same format as target sections, w
 
 
 def _execute_ai_translation(
-    prompt, ai_client, target_sections, pr_diff,
+    prompt, ai_client, target_sections, source_sections, prompt_pr_diff,
     target_file_prefix, prompt_suffix,
     source_language, target_language, source_mode="",
+    glossary_matcher=None,
 ):
     """Send prompt to AI, parse, enforce minimal updates, save, and return result dict."""
     formatted_source_preview = ""
@@ -1013,7 +2105,10 @@ def _execute_ai_translation(
     )
     verbose_thread_safe_print(f"   " + "="*80)
     verbose_thread_safe_print(f"   Source Sections: {formatted_source_preview}...")
-    verbose_thread_safe_print(f"   PR Diff (first 500 chars): {pr_diff[:500] if pr_diff else '(none)'}...")
+    verbose_thread_safe_print(
+        "   PR Diff (first 500 chars): "
+        f"{prompt_pr_diff[:500] if prompt_pr_diff else '(none)'}..."
+    )
     verbose_thread_safe_print(f"   Target Sections: {formatted_target_preview}...")
     verbose_thread_safe_print(f"   " + "="*80)
 
@@ -1066,24 +2161,64 @@ def _execute_ai_translation(
             partial_reasons.append(
                 "AI response ignored unexpected section keys: " + ", ".join(extra_keys)
             )
+        main_result_keys = set(result)
         result = rewrite_tidb_version_anchors_in_sections(
             result,
             source_language,
             target_language,
             source_mode=source_mode,
         )
-        result = enforce_minimal_target_updates(target_sections, result, pr_diff)
+        result = enforce_minimal_target_updates(
+            target_sections,
+            result,
+            prompt_pr_diff,
+        )
+        (
+            result,
+            heading_partial_reasons,
+            already_equivalent_heading_keys,
+        ) = translate_changed_headings_with_ai(
+            source_sections,
+            target_sections,
+            result,
+            prompt_pr_diff,
+            ai_client,
+            source_language,
+            target_language,
+            target_file_prefix,
+            prompt_suffix,
+            glossary_matcher=glossary_matcher,
+        )
+        result, anchor_partial_reasons = restore_expected_heading_anchors(
+            source_sections,
+            result,
+            prompt_pr_diff,
+        )
+        h1_partial_reasons = find_unapplied_modified_h1_sections(
+            source_sections,
+            target_sections,
+            result,
+            prompt_pr_diff,
+            already_equivalent_keys=already_equivalent_heading_keys,
+        )
+        partial_reasons.extend(anchor_partial_reasons)
+        partial_reasons.extend(heading_partial_reasons)
+        partial_reasons.extend(h1_partial_reasons)
         if getattr(ai_response, "completion_status", "complete") == "incomplete":
             partial_reasons.append(
                 "AI response incomplete: "
                 + (getattr(ai_response, "completion_reason", "") or "unknown reason")
             )
-        missing_keys = sorted(expected_keys - set(result))
+        # Heading repair must not hide a section omitted by the main response.
+        missing_keys = sorted(expected_keys - main_result_keys)
         if missing_keys:
             partial_reasons.append(
                 "AI response missing section keys: " + ", ".join(missing_keys)
             )
-        result = TranslationResult(result, partial_reasons=partial_reasons)
+        result = TranslationResult(
+            result,
+            partial_reasons=list(dict.fromkeys(partial_reasons)),
+        )
         thread_safe_print(f"   📊 Parsed {len(result)} sections from AI response")
 
         ai_results_file = os.path.join(
@@ -1189,7 +2324,8 @@ def get_updated_sections_from_ai_chunked(
             "keys": chunk_keys,
             "type": chunk["type"],
             "prompt": prompt,
-            "chunk_diff": chunk_diff,
+            "prompt_pr_diff": prompt_pr_diff,
+            "chunk_source": chunk_source,
             "chunk_target": chunk_target,
             "section_summary": section_summary,
             "chunk_label": chunk_label,
@@ -1221,12 +2357,14 @@ def get_updated_sections_from_ai_chunked(
             cp["prompt"],
             ai_client,
             cp["chunk_target"],
-            cp["chunk_diff"],
+            cp["chunk_source"],
+            cp["prompt_pr_diff"],
             target_file_prefix,
             f".{cp['chunk_label']}",
             source_language,
             target_language,
             source_mode=source_mode,
+            glossary_matcher=glossary_matcher,
         )
 
         if not chunk_result:
@@ -1364,10 +2502,11 @@ def get_updated_sections_from_ai(pr_diff, target_sections, source_old_content_di
     thread_safe_print(f"🤖 Sending prompt to AI...")
 
     result = _execute_ai_translation(
-        prompt, ai_client, target_sections, pr_diff,
+        prompt, ai_client, target_sections, source_sections, prompt_pr_diff,
         target_file_prefix, prompt_suffix,
         source_language, target_language,
         source_mode=source_mode,
+        glossary_matcher=glossary_matcher,
     )
     return _restore_result(result)
 

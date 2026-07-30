@@ -2738,6 +2738,130 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     
     # Process added sections - find next section from current document hierarchy
     added_line_nums = set(int(ln) for ln in added_sections.keys())
+    modified_heading_originals = {
+        int(modified_line["line_number"]): modified_line["original_content"].strip()
+        for modified_line in operations.get("modified_lines", [])
+        if (
+            modified_line.get("is_header")
+            and modified_line.get("line_number") is not None
+            and modified_line.get("original_content")
+        )
+    }
+
+    def find_base_hierarchy_for_head_heading(
+        curr_line_num,
+        curr_hierarchy,
+        heading_text,
+        use_original_heading_identities,
+    ):
+        """Resolve a HEAD heading to BASE by identity and parent hierarchy."""
+        heading_clean = clean_title_for_matching(heading_text)
+        candidates = []
+        for base_line_num, base_hierarchy in base_hierarchy_dict.items():
+            base_leaf = (
+                base_hierarchy.split(" > ")[-1]
+                if " > " in base_hierarchy
+                else base_hierarchy
+            )
+            if clean_title_for_matching(base_leaf) == heading_clean:
+                candidates.append((int(base_line_num), base_hierarchy))
+
+        if len(candidates) == 1:
+            return candidates[0][1]
+        if not candidates:
+            return None
+
+        curr_parents = (
+            curr_hierarchy.split(" > ")[:-1]
+            if " > " in curr_hierarchy
+            else []
+        )
+        scored_candidates = []
+        for base_line_num, base_hierarchy in candidates:
+            base_parents = (
+                base_hierarchy.split(" > ")[:-1]
+                if " > " in base_hierarchy
+                else []
+            )
+            score = 0
+            for index in range(1, min(len(curr_parents), len(base_parents)) + 1):
+                if (
+                    clean_title_for_matching(curr_parents[-index])
+                    == clean_title_for_matching(base_parents[-index])
+                ):
+                    score += 1
+                else:
+                    break
+            scored_candidates.append((score, base_line_num, base_hierarchy))
+
+        max_score = max(score for score, _, _ in scored_candidates)
+        top_candidates = [
+            (base_line_num, base_hierarchy)
+            for score, base_line_num, base_hierarchy in scored_candidates
+            if score == max_score
+        ]
+        if len(top_candidates) == 1 and max_score > 0:
+            return top_candidates[0][1]
+        if max_score == 0:
+            return None
+
+        # For repeated headings, compare global occurrence ordinals after
+        # modified HEAD titles are restored to their BASE identity. Candidate
+        # parent scoring still limits which BASE occurrences can win.
+        head_occurrences = []
+        for head_line_num, head_hierarchy in sorted(
+            (int(line_num), hierarchy)
+            for line_num, hierarchy in all_hierarchy_dict.items()
+        ):
+            head_leaf = (
+                head_hierarchy.split(" > ")[-1]
+                if " > " in head_hierarchy
+                else head_hierarchy
+            )
+            effective_leaf = (
+                modified_heading_originals.get(head_line_num, head_leaf)
+                if use_original_heading_identities
+                else head_leaf
+            )
+            if clean_title_for_matching(effective_leaf) == heading_clean:
+                head_occurrences.append(head_line_num)
+
+        current_ordinal = (
+            head_occurrences.index(curr_line_num)
+            if curr_line_num in head_occurrences
+            else 0
+        )
+        base_occurrences = sorted(
+            base_line_num
+            for base_line_num, base_hierarchy in candidates
+            if clean_title_for_matching(
+                base_hierarchy.split(" > ")[-1]
+                if " > " in base_hierarchy
+                else base_hierarchy
+            ) == heading_clean
+        )
+        base_ordinal_by_line = {
+            base_line_num: ordinal
+            for ordinal, base_line_num in enumerate(base_occurrences)
+        }
+        top_candidates.sort(
+            key=lambda item: (
+                abs(
+                    base_ordinal_by_line.get(item[0], len(base_occurrences))
+                    - current_ordinal
+                ),
+                item[0],
+            )
+        )
+        best_line_num, best_hierarchy = top_candidates[0]
+        print(
+            f"   ⚠️  {len(top_candidates)} candidates tied at "
+            f"parent-hierarchy score {max_score} for '{heading_clean}'; "
+            f"chose base line {best_line_num} by ordinal position "
+            f"(HEAD ordinal {current_ordinal}, BASE ordinal "
+            f"{base_ordinal_by_line.get(best_line_num, '?')})"
+        )
+        return best_hierarchy
 
     for line_num_str, hierarchy in added_sections.items():
         line_num = int(line_num_str)
@@ -2758,130 +2882,50 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                 # serve as stable insertion anchors against the BASE document.
                 if curr_line_num in added_line_nums:
                     continue
-                # Found the next section in current document
-                # Now find its original hierarchy in base document
-                curr_line_str = str(curr_line_num)
-                
-                # Get the original hierarchy for this next section
-                # Use the same logic as build_complete_original_hierarchy to get original content
-                if curr_line_str in base_hierarchy_dict:
-                    # Check if this section was modified
-                    was_modified = False
-                    for modified_line in operations.get('modified_lines', []):
-                        if (modified_line.get('is_header') and 
-                            modified_line.get('line_number') == curr_line_num and 
-                            'original_content' in modified_line):
-                            # This section was modified, use original content
-                            original_line = modified_line['original_content'].strip()
-                            base_hierarchy = base_hierarchy_dict[curr_line_str]
-                            
-                            if ' > ' in base_hierarchy:
-                                # Replace the leaf with original content
-                                hierarchy_parts = base_hierarchy.split(' > ')
-                                hierarchy_parts[-1] = original_line
-                                next_section_original_hierarchy = ' > '.join(hierarchy_parts)
-                            else:
-                                next_section_original_hierarchy = original_line
-                            
-                            print(f"   ✅ Found next section (modified): line {curr_line_num} -> {next_section_original_hierarchy.split(' > ')[-1] if ' > ' in next_section_original_hierarchy else next_section_original_hierarchy}")
-                            was_modified = True
-                            break
-                    
-                    if not was_modified:
-                        # Section was not modified, use base hierarchy directly
-                        next_section_original_hierarchy = base_hierarchy_dict[curr_line_str]
-                        print(f"   ✅ Found next section (unchanged): line {curr_line_num} -> {next_section_original_hierarchy.split(' > ')[-1] if ' > ' in next_section_original_hierarchy else next_section_original_hierarchy}")
-                    
-                    break
-                else:
-                    # This next section might also be new or modified
-                    # Try to find it by content matching in base hierarchy
-                    curr_leaf = curr_hierarchy.split(' > ')[-1] if ' > ' in curr_hierarchy else curr_hierarchy
-                    curr_clean = clean_title_for_matching(curr_leaf)
+                curr_leaf = (
+                    curr_hierarchy.split(" > ")[-1]
+                    if " > " in curr_hierarchy
+                    else curr_hierarchy
+                )
 
-                    leaf_match_candidates = []
-                    for base_line_str, base_hierarchy in base_hierarchy_dict.items():
-                        base_leaf = base_hierarchy.split(' > ')[-1] if ' > ' in base_hierarchy else base_hierarchy
-                        base_clean = clean_title_for_matching(base_leaf)
-                        if curr_clean == base_clean:
-                            leaf_match_candidates.append((base_line_str, base_hierarchy))
-
-                    if len(leaf_match_candidates) == 1:
-                        next_section_original_hierarchy = leaf_match_candidates[0][1]
-                        print(f"   ✅ Found next section (by content): {leaf_match_candidates[0][1].split(' > ')[-1] if ' > ' in leaf_match_candidates[0][1] else leaf_match_candidates[0][1]}")
+                # A modified heading keeps its BASE identity even when earlier
+                # insertions shift its line number in HEAD.
+                original_heading = modified_heading_originals.get(curr_line_num)
+                if original_heading:
+                    next_section_original_hierarchy = (
+                        find_base_hierarchy_for_head_heading(
+                            curr_line_num,
+                            curr_hierarchy,
+                            original_heading,
+                            True,
+                        )
+                    )
+                    if next_section_original_hierarchy:
+                        print(
+                            f"   ✅ Found next section (modified): line {curr_line_num} -> "
+                            f"{next_section_original_hierarchy.split(' > ')[-1]}"
+                        )
                         break
-                    elif len(leaf_match_candidates) > 1:
-                        # Multiple candidates share the same leaf title (e.g. "Step 3"
-                        # under different parent sections). Disambiguate by comparing
-                        # the parent hierarchy path from the HEAD file against each
-                        # candidate in the base file.
-                        curr_parents = curr_hierarchy.split(' > ')[:-1] if ' > ' in curr_hierarchy else []
-                        scored_candidates = []
 
-                        for cand_line, cand_hierarchy in leaf_match_candidates:
-                            cand_parents = cand_hierarchy.split(' > ')[:-1] if ' > ' in cand_hierarchy else []
-                            score = 0
-                            for i in range(1, min(len(curr_parents), len(cand_parents)) + 1):
-                                if clean_title_for_matching(curr_parents[-i]) == clean_title_for_matching(cand_parents[-i]):
-                                    score += 1
-                                else:
-                                    break
-                            scored_candidates.append((score, cand_line, cand_hierarchy))
+                next_section_original_hierarchy = (
+                    find_base_hierarchy_for_head_heading(
+                        curr_line_num,
+                        curr_hierarchy,
+                        curr_leaf,
+                        False,
+                    )
+                )
+                if next_section_original_hierarchy:
+                    print(
+                        f"   ✅ Found next section (by content): "
+                        f"{next_section_original_hierarchy.split(' > ')[-1]}"
+                    )
+                    break
 
-                        max_score = max(sc for sc, _, _ in scored_candidates)
-                        if max_score > 0:
-                            top_tier = [(cl, ch) for sc, cl, ch in scored_candidates if sc == max_score]
-                            if len(top_tier) == 1:
-                                best_candidate = top_tier[0]
-                            else:
-                                # Tie at the same positive score: break by ordinal
-                                # position among same-titled headings.  Comparing
-                                # raw BASE vs HEAD line numbers is unreliable when
-                                # insertions/deletions shift the file, so instead we
-                                # match the Nth occurrence in HEAD to the Nth in BASE.
-                                head_same_title = sorted([
-                                    (int(ln), h) for ln, h in all_hierarchy_dict.items()
-                                    if clean_title_for_matching(
-                                        h.split(' > ')[-1] if ' > ' in h else h
-                                    ) == curr_clean
-                                ])
-                                curr_ordinal = next(
-                                    (idx for idx, (ln, _) in enumerate(head_same_title)
-                                     if ln == curr_line_num),
-                                    0,
-                                )
-
-                                base_same_title = sorted([
-                                    (int(ln), h) for ln, h in base_hierarchy_dict.items()
-                                    if clean_title_for_matching(
-                                        h.split(' > ')[-1] if ' > ' in h else h
-                                    ) == curr_clean
-                                ])
-                                base_ordinal_map = {
-                                    str(ln): idx
-                                    for idx, (ln, _) in enumerate(base_same_title)
-                                }
-
-                                top_tier.sort(
-                                    key=lambda x: abs(
-                                        base_ordinal_map.get(x[0], len(base_same_title))
-                                        - curr_ordinal
-                                    )
-                                )
-                                best_candidate = top_tier[0]
-                                print(
-                                    f"   ⚠️  {len(top_tier)} candidates tied at parent-hierarchy score {max_score} "
-                                    f"for '{curr_clean}'; chose base line {best_candidate[0]} by ordinal position "
-                                    f"(HEAD ordinal {curr_ordinal}, BASE ordinal {base_ordinal_map.get(best_candidate[0], '?')})"
-                                )
-                            next_section_original_hierarchy = best_candidate[1]
-                            leaf_for_log = best_candidate[1].split(' > ')[-1] if ' > ' in best_candidate[1] else best_candidate[1]
-                            print(f"   ✅ Found next section (by content, disambiguated among {len(leaf_match_candidates)} candidates): {leaf_for_log}")
-                            break
-                        else:
-                            print(f"   ⚠️  {len(leaf_match_candidates)} candidates for '{curr_clean}' but parent hierarchy could not disambiguate, continuing search...")
-                    
-                    print(f"   ⚠️  Next section at line {curr_line_num} not found in base, continuing search...")
+                print(
+                    f"   ⚠️  Next section at line {curr_line_num} not found in base, "
+                    "continuing search..."
+                )
         
         # If no next section found, this is being added at the end
         if not next_section_original_hierarchy:
