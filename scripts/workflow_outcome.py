@@ -171,3 +171,27 @@ class RunReport:
                 f.write("\n")
         elif os.path.exists(structure_json_path):
             os.remove(structure_json_path)
+
+
+def record_file_task_result(task_result, run_report):
+    """Record one ``run_file_tasks`` result and return its status and reason."""
+    file_path = task_result["file_path"]
+    if not task_result.get("ok"):
+        status = "failure"
+        reason = task_result.get("error") or "File task raised an exception"
+    else:
+        result = task_result.get("result") or {}
+        status = result.get("status", "failure")
+        reason = result.get("reason", "")
+
+    if status == "success":
+        run_report.mark_success(file_path)
+    elif status == "partial":
+        run_report.mark_partial(file_path, reason)
+    elif status == "skipped":
+        run_report.mark_skipped(file_path, reason)
+    else:
+        status = "failure"
+        run_report.mark_failure(file_path, reason)
+
+    return status, reason

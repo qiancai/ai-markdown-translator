@@ -13,7 +13,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from log_sanitizer import safe_target_path
 from special_file_utils import path_resource_key
-from workflow_outcome import FileOutcomes
+from workflow_outcome import FileOutcomes, RunReport, record_file_task_result
 from file_io import atomic_write_bytes, atomic_write_text
 
 
@@ -58,6 +58,22 @@ class FileOutcomesTest(unittest.TestCase):
         outcomes.add("guide.md", "failed", "network error")
         self.assertTrue(outcomes)
         self.assertFalse(outcomes.all_succeeded)
+
+    def test_records_parallel_task_statuses_consistently(self):
+        report = RunReport()
+        status, reason = record_file_task_result(
+            {
+                "file_path": "guide.md",
+                "ok": True,
+                "result": {"status": "partial", "reason": "one chunk failed"},
+                "error": None,
+            },
+            report,
+        )
+
+        self.assertEqual("partial", status)
+        self.assertEqual("one chunk failed", reason)
+        self.assertEqual([("guide.md", "one chunk failed")], report.partial)
 
 
 class AtomicFileWriteTest(unittest.TestCase):

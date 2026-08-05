@@ -16,6 +16,7 @@ import threading
 from typing import Optional
 from urllib.parse import urlparse
 from github import Github
+from formatting_sync import build_formatting_only_change
 from log_sanitizer import sanitize_exception_message, safe_target_path
 from section_matcher import clean_title_for_matching
 from special_file_utils import find_heading_line_indices, is_index_file_name, is_learning_path_index_content, is_toc_file_name, path_resource_key
@@ -2984,11 +2985,15 @@ def analyze_source_changes(
     pr_diff=None,
     exclude_folders=None,
     source_files=None,
+    include_formatting_files=False,
 ):
     """Analyze source language changes and categorize them as added, modified, or deleted
     
     Args:
         exclude_folders: list of folder names to skip entirely (e.g. ["tidb-cloud", "ai"])
+        include_formatting_files: append the formatting-only queue to the
+            historical 12-item return tuple. Existing callers remain compatible
+            unless they explicitly opt into the additional result.
     """
     # Import modules needed in this function
     import os
@@ -3081,6 +3086,8 @@ def analyze_source_changes(
     toc_files = {}           # Special TOC files requiring special processing
     keyword_files = {}       # Special keyword files requiring keyword-specific processing
     index_files = {}         # Special _index.md files requiring index-specific processing
+    formatting_files = {}    # Files containing only deterministic whitespace changes
+    empty_source_diff_files = []  # Canonical no-op files retained for diagnostics
     
     # Image-related returns
     added_images = []        # New image files that were added
@@ -3498,6 +3505,32 @@ def analyze_source_changes(
         )
         print(f"   📝 Effective diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
 
+        # TOC and keyword files retain their specialized semantics. LearningPath
+        # index files have already continued above; normal index files still use
+        # the regular path and are safe to consider here.
+        if not (is_toc_file or is_keyword_file):
+            formatting_head_content = file_content
+            if should_ignore_related_resources_resource_card_sections(source_context):
+                effective_head_content, _ = preserve_base_related_resources_resource_card_sections(
+                    base_file_content,
+                    file_content,
+                )
+                if effective_head_content is not None:
+                    formatting_head_content = effective_head_content
+
+            formatting_change = build_formatting_only_change(
+                base_file_content,
+                formatting_head_content,
+            )
+            if formatting_change:
+                formatting_change["source_patch"] = getattr(file, "patch", "") or ""
+                formatting_files[file.filename] = formatting_change
+                print(
+                    f"   🧹 Queued {len(formatting_change['changes'])} "
+                    "formatting-only change(s) for deterministic target sync"
+                )
+                continue
+
         # Fast-path: if ALL changes are heading-level-only (# count changes),
         # skip the restructure detection entirely and proceed to incremental
         # processing which will handle them without AI translation.
@@ -3736,6 +3769,18 @@ def analyze_source_changes(
                         "RelatedResources filtering"
                     )
                     continue
+
+        if not source_diff_dict:
+            # The canonical source diff has no section-level translation work.
+            # Do not let the legacy affected-section detector enqueue the file
+            # and turn an intentional no-op into a misleading matcher failure.
+            modified_sections.pop(file.filename, None)
+            empty_source_diff_files.append(file.filename)
+            print(
+                "   ⏭️  No translatable section changes remain; "
+                "skipping regular modified-file processing"
+            )
+            continue
         
         # Breakpoint: Output source_diff_dict to file for review with file prefix
         
@@ -3952,6 +3997,7 @@ def analyze_source_changes(
     print(f"   🗑️  Deleted files: {len(deleted_files)} files")
     print(f"   📋 TOC files: {len(toc_files)} files")
     print(f"   📋 Keyword files: {len(keyword_files)} files")
+    print(f"   🧹 Formatting-only files: {len(formatting_files)} files")
     print(f"   🖼️  Added images: {len(added_images)} images")
     print(f"   🖼️  Modified images: {len(modified_images)} images")
     print(f"   🖼️  Deleted images: {len(deleted_images)} images")
@@ -3959,5 +4005,28 @@ def analyze_source_changes(
         print(f"   ⏭️  Ignored files: {len(ignored_files)} files")
         for ignored_file in ignored_files:
             print(f"      - {ignored_file}")
-    
-    return added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files
+    if empty_source_diff_files:
+        print(
+            "   ⏭️  Canonical no-op modified files: "
+            f"{len(empty_source_diff_files)} files"
+        )
+        for no_op_file in empty_source_diff_files:
+            print(f"      - {no_op_file}")
+
+    result = (
+        added_sections,
+        modified_sections,
+        deleted_sections,
+        added_files,
+        deleted_files,
+        toc_files,
+        keyword_files,
+        added_images,
+        modified_images,
+        deleted_images,
+        restructured_files,
+        index_files,
+    )
+    if include_formatting_files:
+        return (*result, formatting_files)
+    return result

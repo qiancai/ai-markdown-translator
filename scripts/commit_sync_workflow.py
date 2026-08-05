@@ -69,6 +69,7 @@ from file_updater import (
 from structural_reconciler import reconcile_restructured_file
 from file_deleter import process_deleted_files
 from file_io import atomic_write_text
+from formatting_sync import apply_formatting_only_change_with_ai_fallback
 from glossary import create_glossary_matcher, load_glossary
 from image_processor import process_all_images
 from keword_processor import process_keyword_file
@@ -98,7 +99,7 @@ from translation_structure_validator import (
     validate_markdown_heading_structures,
 )
 from workflow_ignore_config import load_workflow_ignore_config
-from workflow_outcome import FileOutcomes, RunReport
+from workflow_outcome import FileOutcomes, RunReport, record_file_task_result
 from special_file_utils import path_resource_key
 
 WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
@@ -143,30 +144,20 @@ class TranslationStats(RunReport):
 
 def _record_translation_task_result(task_result, translation_stats):
     file_path = task_result["file_path"]
-    if not task_result["ok"]:
-        thread_safe_print(f"   ❌ Failed to process {file_path}: {task_result['error']}")
-        translation_stats.mark_failure(file_path, task_result["error"])
-        return False
-
-    result = task_result["result"] or {}
-    status = result.get("status", "failure")
-    reason = result.get("reason", "")
+    status, reason = record_file_task_result(task_result, translation_stats)
 
     if status == "success":
-        thread_safe_print(f"   ✅ Successfully processed {file_path}")
-        translation_stats.mark_success(file_path)
+        detail = f": {reason}" if reason else ""
+        thread_safe_print(f"   ✅ Successfully processed {file_path}{detail}")
         return True
     if status == "partial":
         thread_safe_print(f"   ⚠️  Partially processed {file_path}: {reason}")
-        translation_stats.mark_partial(file_path, reason)
         return True
     if status == "skipped":
         thread_safe_print(f"   ⏭️  Skipped {file_path}: {reason}")
-        translation_stats.mark_skipped(file_path, reason)
         return False
 
     thread_safe_print(f"   ❌ Failed to process {file_path}: {reason}")
-    translation_stats.mark_failure(file_path, reason)
     return False
 
 
@@ -1042,6 +1033,7 @@ def remove_incremental_work_for_files(
     toc_files,
     keyword_files,
     index_files=None,
+    formatting_files=None,
 ):
     """Remove per-diff work queues for files that will be translated in full."""
     for file_path in file_paths:
@@ -1052,6 +1044,8 @@ def remove_incremental_work_for_files(
         keyword_files.pop(file_path, None)
         if index_files is not None:
             index_files.pop(file_path, None)
+        if formatting_files is not None:
+            formatting_files.pop(file_path, None)
 
 
 def apply_source_files_full_translation_mode(
@@ -1069,6 +1063,7 @@ def apply_source_files_full_translation_mode(
     keyword_files,
     translation_stats,
     index_files=None,
+    formatting_files=None,
 ):
     """Switch selected SOURCE_FILES from diff-based queues to full-file translation."""
     thread_safe_print(
@@ -1095,6 +1090,7 @@ def apply_source_files_full_translation_mode(
         toc_files,
         keyword_files,
         index_files=index_files,
+        formatting_files=formatting_files,
     )
     added_files.update(full_translation_files)
     for file_path in full_translation_failures:
@@ -1192,6 +1188,7 @@ def apply_toc_scope_added_files(
     keyword_files,
     translation_stats,
     index_files=None,
+    formatting_files=None,
 ):
     """Queue files newly linked from Cloud TOCs for full file-added translation."""
     scope_added_file_paths = collect_toc_scope_added_files(
@@ -1226,6 +1223,7 @@ def apply_toc_scope_added_files(
         {},
         keyword_files,
         index_files=index_files,
+        formatting_files=formatting_files,
     )
     added_files.update(scope_added_file_contents)
 
@@ -1362,6 +1360,7 @@ def print_group_summary(group_label, counts):
     thread_safe_print(f"   📋 TOC files: {counts['toc_files']} processed")
     thread_safe_print(f"   📋 Keyword files: {counts['keyword_files']} processed")
     thread_safe_print(f"   📄 Index files: {counts.get('index_files', 0)} processed")
+    thread_safe_print(f"   🧹 Formatting-only files: {counts.get('formatting_files', 0)} processed")
     thread_safe_print(f"   📝 Modified files: {counts['modified_sections']} processed")
     thread_safe_print(f"   🖼️  Added images: {counts['added_images']} processed")
     thread_safe_print(f"   🖼️  Modified images: {counts['modified_images']} processed")
@@ -1571,6 +1570,7 @@ def process_translation_group(
         toc_files = {}
         keyword_files = {}
         index_files = {}
+        formatting_files = {}
         added_images = []
         modified_images = []
         deleted_images = []
@@ -1587,6 +1587,7 @@ def process_translation_group(
                     "toc_files": 0,
                     "keyword_files": 0,
                     "index_files": 0,
+                    "formatting_files": 0,
                     "modified_sections": 0,
                     "added_images": 0,
                     "modified_images": 0,
@@ -1603,7 +1604,7 @@ def process_translation_group(
         exclude_folders = build_exclude_folders(repo_config)
 
         try:
-            added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files = analyze_source_changes(
+            added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files, formatting_files = analyze_source_changes(
                 diff_context,
                 github_client,
                 special_files=SPECIAL_FILES,
@@ -1612,6 +1613,7 @@ def process_translation_group(
                 max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
                 pr_diff=pr_diff,
                 exclude_folders=exclude_folders,
+                include_formatting_files=True,
             )
         except Exception as e:
             translation_stats.mark_failure(
@@ -1626,6 +1628,8 @@ def process_translation_group(
                     "deleted_files": 0,
                     "toc_files": 0,
                     "keyword_files": 0,
+                    "index_files": 0,
+                    "formatting_files": 0,
                     "modified_sections": 0,
                     "added_images": 0,
                     "modified_images": 0,
@@ -1650,6 +1654,7 @@ def process_translation_group(
             keyword_files,
             translation_stats,
             index_files=index_files,
+            formatting_files=formatting_files,
         )
     else:
         explicit_source_files = normalize_source_files(source_files, source_folder)
@@ -1671,6 +1676,7 @@ def process_translation_group(
                     keyword_files,
                     translation_stats,
                     index_files=index_files,
+                    formatting_files=formatting_files,
                 )
             )
 
@@ -1843,6 +1849,50 @@ def process_translation_group(
                 successful_file_paths.add(result["file_path"])
         git_add_successful_task_changes(index_results, TARGET_REPO_PATH)
 
+    if formatting_files:
+        thread_safe_print(
+            f"\n🧹 Processing {len(formatting_files)} formatting-only files..."
+        )
+        formatting_tasks = []
+        for file_path, formatting_data in formatting_files.items():
+            def run_formatting_file(path=file_path, data=formatting_data):
+                success, changed, reason, ai_attempted = (
+                    apply_formatting_only_change_with_ai_fallback(
+                        path,
+                        data,
+                        repo_config['target_local_path'],
+                        ai_client,
+                        repo_config['source_language'],
+                        repo_config['target_language'],
+                    )
+                )
+                if ai_attempted and success:
+                    thread_safe_print(
+                        f"   🤖 Used AI-assisted formatting line mapping for {path}"
+                    )
+                elif ai_attempted:
+                    thread_safe_print(
+                        f"   🤖 Attempted AI-assisted formatting line mapping for {path}"
+                    )
+                if not success:
+                    return make_task_result("failure", reason)
+                return make_task_result(
+                    "success",
+                    reason or ("Formatting already synchronized" if not changed else ""),
+                )
+
+            formatting_tasks.append(make_file_task(file_path, run_formatting_file))
+
+        formatting_results = run_file_tasks(
+            formatting_tasks,
+            "formatting-only files",
+            parallel_file_processing,
+        )
+        for result in formatting_results:
+            if _record_translation_task_result(result, translation_stats):
+                successful_file_paths.add(result["file_path"])
+        git_add_successful_task_changes(formatting_results, TARGET_REPO_PATH)
+
     if modified_sections:
         thread_safe_print(f"\n📝 Processing {len(modified_sections)} modified files...")
         modified_tasks = []
@@ -1901,6 +1951,7 @@ def process_translation_group(
         "toc_files": len(toc_files),
         "keyword_files": len(keyword_files),
         "index_files": len(index_files),
+        "formatting_files": len(formatting_files),
         "modified_sections": len(modified_sections),
         "added_images": len(added_images),
         "modified_images": len(modified_images),
@@ -2013,6 +2064,7 @@ def main():
         "toc_files": 0,
         "keyword_files": 0,
         "index_files": 0,
+        "formatting_files": 0,
         "modified_sections": 0,
         "added_images": 0,
         "modified_images": 0,
@@ -2283,6 +2335,7 @@ def main():
     thread_safe_print(f"   📋 TOC files: {total_counts['toc_files']} processed")
     thread_safe_print(f"   📋 Keyword files: {total_counts['keyword_files']} processed")
     thread_safe_print(f"   📄 Index files: {total_counts.get('index_files', 0)} processed")
+    thread_safe_print(f"   🧹 Formatting-only files: {total_counts.get('formatting_files', 0)} processed")
     thread_safe_print(f"   📝 Modified files: {total_counts['modified_sections']} processed")
     thread_safe_print(f"   🖼️  Added images: {total_counts['added_images']} processed")
     thread_safe_print(f"   🖼️  Modified images: {total_counts['modified_images']} processed")

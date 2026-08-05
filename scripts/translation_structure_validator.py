@@ -71,13 +71,18 @@ def iter_markdown_content_lines(content):
 
 def extract_heading_levels(content):
     """Extract Markdown heading levels while skipping fenced code blocks."""
-    levels = []
-    for _, line in iter_markdown_content_lines(content):
+    return [level for _, level in extract_heading_positions(content)]
+
+
+def extract_heading_positions(content):
+    """Extract ``(line_number, level)`` heading anchors outside code fences."""
+    positions = []
+    for line_number, line in iter_markdown_content_lines(content):
         heading_match = HEADING_RE.match(line)
         if heading_match:
-            levels.append(len(heading_match.group(1)))
+            positions.append((line_number, len(heading_match.group(1))))
 
-    return levels
+    return positions
 
 
 def compact_heading_levels(levels):

@@ -86,7 +86,7 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
         ), mock.patch.object(
             main_workflow,
             "analyze_source_changes",
-            return_value=({}, {}, {}, {}, [], {}, {}, ["docs/media/example.png"], [], [], set(), {}),
+            return_value=({}, {}, {}, {}, [], {}, {}, ["docs/media/example.png"], [], [], set(), {}, {}),
         ) as analyze_source_changes, mock.patch.object(
             main_workflow, "process_all_images"
         ) as process_all_images, mock.patch.object(

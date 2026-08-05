@@ -34,6 +34,8 @@ from diff_analyzer import (
     parse_pr_url,
     preserve_base_related_resources_resource_card_sections,
 )
+from formatting_sync import apply_formatting_only_change, build_formatting_only_change
+from special_file_utils import path_resource_key
 
 
 class FakeContent:
@@ -175,10 +177,357 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         )
 
         self.assertEqual(pr_result, commit_result)
+        self.assertEqual(12, len(pr_result))
         self.assertTrue(self.generated_file.exists())
         source_diff = self.generated_file.read_text(encoding="utf-8")
         self.assertIn('"operation": "modified"', source_diff)
         self.assertIn("New text", source_diff)
+
+    def test_formatting_only_blank_line_change_syncs_target_without_regular_queue(self):
+        file_path = "tidb-cloud/monitor-alert-slack.md"
+        base_content = (
+            "# Subscribe via Slack\n\n"
+            "## Unsubscribe from alert notifications\n\n"
+            '<CustomContent plan="dedicated">\n'
+            "    \n"
+            "1. Unsubscribe.\n\n"
+            "</CustomContent>\n"
+        )
+        head_content = base_content.replace(
+            '<CustomContent plan="dedicated">\n    \n',
+            '<CustomContent plan="dedicated">\n\n',
+        )
+        target_content = (
+            "# 通过 Slack 订阅\n\n"
+            "## 取消报警通知订阅\n\n"
+            '<CustomContent plan="dedicated">\n'
+            "    \n"
+            "1. 取消订阅。\n\n"
+            "</CustomContent>\n"
+        )
+        patch = "\n".join(
+            [
+                "@@ -3,7 +3,7 @@",
+                " ## Unsubscribe from alert notifications",
+                " ",
+                ' <CustomContent plan="dedicated">',
+                "-    ",
+                "+",
+                " 1. Unsubscribe.",
+                " ",
+                " </CustomContent>",
+            ]
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch=patch,
+            previous_filename=None,
+        )
+        source_repo = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Remove trailing spaces", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir, file_path)
+            target_path.parent.mkdir(parents=True)
+            target_path.write_text(target_content, encoding="utf-8")
+            repo_configs = {
+                "acme/docs": {
+                    "target_repo": "acme/docs-cn",
+                    "target_local_path": tmpdir,
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                }
+            }
+            github = FakeGithub({"acme/docs": source_repo})
+            context = build_commit_diff_context(
+                "acme/docs",
+                "acme/docs-cn",
+                "base123",
+                "head123",
+                github,
+                repo_configs,
+            )
+
+            result = analyze_source_changes(
+                context,
+                github,
+                special_files=["TOC.md", "keywords.md"],
+                ignore_files=[],
+                repo_configs=repo_configs,
+                include_formatting_files=True,
+            )
+
+            modified_sections = result[1]
+            formatting_files = result[12]
+            self.assertEqual({}, modified_sections)
+            self.assertEqual([file_path], list(formatting_files))
+            self.assertEqual(patch, formatting_files[file_path]["source_patch"])
+            self.assertFalse(
+                (
+                    self.temp_output_dir
+                    / f"{path_resource_key(file_path)}-source-diff-dict.json"
+                ).exists()
+            )
+
+            success, changed, reason = apply_formatting_only_change(
+                file_path,
+                formatting_files[file_path],
+                tmpdir,
+            )
+            self.assertTrue(success, reason)
+            self.assertTrue(changed)
+            self.assertIn(
+                '<CustomContent plan="dedicated">\n\n1. 取消订阅。',
+                target_path.read_text(encoding="utf-8"),
+            )
+
+    def test_empty_source_diff_does_not_enter_regular_modified_queue(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## Section\n    \nText.\n"
+        head_content = "# Guide\n\n## Section\n\nText.\n"
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch="@@ -3,3 +3,3 @@\n ## Section\n-    \n+\n Text.",
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Whitespace", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        with mock.patch(
+            "diff_analyzer.build_formatting_only_change",
+            return_value=None,
+        ), mock.patch("builtins.print") as print_mock:
+            result = analyze_source_changes(
+                context,
+                github,
+                special_files=["TOC.md", "keywords.md"],
+                ignore_files=[],
+                repo_configs=self.repo_configs,
+                include_formatting_files=True,
+            )
+
+        self.assertEqual({}, result[1])
+        self.assertEqual({}, result[12])
+        rendered_log = "\n".join(
+            " ".join(str(arg) for arg in call.args)
+            for call in print_mock.call_args_list
+        )
+        self.assertIn("Canonical no-op modified files: 1 files", rendered_log)
+
+    def test_toc_whitespace_only_change_stays_on_toc_path(self):
+        file_path = "TOC-test.md"
+        base_content = "- [Guide](/guide.md)   \n"
+        head_content = "- [Guide](/guide.md)\n"
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch="@@ -1 +1 @@\n-- [Guide](/guide.md)   \n+- [Guide](/guide.md)",
+            previous_filename=None,
+        )
+        repo_configs = {
+            "acme/docs": {
+                "target_repo": "acme/docs-cn",
+                "target_local_path": "/tmp/target",
+                "prefer_local_target_for_read": False,
+                "source_language": "English",
+                "target_language": "Chinese",
+            }
+        }
+        source_repo = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "TOC whitespace", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        target_repo = FakeRepository(
+            {(file_path, "master"): "- [指南](/guide.md)\n"},
+            FakePR([], "Empty", "base123", "head123"),
+            {},
+        )
+        github = FakeGithub(
+            {"acme/docs": source_repo, "acme/docs-cn": target_repo}
+        )
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=repo_configs,
+            include_formatting_files=True,
+        )
+
+        self.assertIn(file_path, result[5])
+        self.assertEqual({}, result[12])
+
+    def test_keyword_and_index_whitespace_changes_do_not_use_formatting_path(self):
+        cases = {
+            "keywords.md": "# Keywords\n    \nText.\n",
+            "docs/_index.md": "<LearningPathContainer>\n    \n</LearningPathContainer>\n",
+        }
+
+        for file_path, base_content in cases.items():
+            with self.subTest(file_path=file_path):
+                head_content = base_content.replace("    \n", "\n")
+                changed_file = SimpleNamespace(
+                    filename=file_path,
+                    status="modified",
+                    patch="@@ -1,3 +1,3 @@\n context\n-    \n+\n context",
+                    previous_filename=None,
+                )
+                repository = FakeRepository(
+                    {
+                        (file_path, "base123"): base_content,
+                        (file_path, "head123"): head_content,
+                    },
+                    FakePR(
+                        [changed_file],
+                        "Special whitespace",
+                        "base123",
+                        "head123",
+                    ),
+                    {("base123", "head123"): [changed_file]},
+                )
+                github = FakeGithub({"acme/docs": repository})
+                context = build_commit_diff_context(
+                    "acme/docs",
+                    "acme/docs-cn",
+                    "base123",
+                    "head123",
+                    github,
+                    self.repo_configs,
+                )
+
+                with mock.patch(
+                    "diff_analyzer.build_formatting_only_change",
+                    wraps=build_formatting_only_change,
+                ) as formatting_detector:
+                    result = analyze_source_changes(
+                        context,
+                        github,
+                        special_files=["TOC.md", "keywords.md"],
+                        ignore_files=[],
+                        repo_configs=self.repo_configs,
+                        include_formatting_files=True,
+                    )
+
+                formatting_detector.assert_not_called()
+                self.assertEqual({}, result[12])
+                if file_path.endswith("_index.md"):
+                    self.assertIn(file_path, result[11])
+
+    def test_normal_index_whitespace_change_uses_formatting_path(self):
+        file_path = "docs/_index.md"
+        base_content = "# Overview\n\n## Usage\n    \nText.\n"
+        head_content = base_content.replace("    \n", "\n")
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch="@@ -3,3 +3,3 @@\n ## Usage\n-    \n+\n Text.",
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Index whitespace", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+            include_formatting_files=True,
+        )
+
+        self.assertEqual({}, result[11])
+        self.assertIn(file_path, result[12])
+
+    def test_blank_line_insertion_remains_section_translation_work(self):
+        file_path = "guide.md"
+        base_content = "# Guide\n\n## Section\nText.\n"
+        head_content = "# Guide\n\n## Section\n\nText.\n"
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch="@@ -3,2 +3,3 @@\n ## Section\n+\n Text.",
+            previous_filename=None,
+        )
+        repository = FakeRepository(
+            {
+                (file_path, "base123"): base_content,
+                (file_path, "head123"): head_content,
+            },
+            FakePR([changed_file], "Add blank line", "base123", "head123"),
+            {("base123", "head123"): [changed_file]},
+        )
+        github = FakeGithub({"acme/docs": repository})
+        context = build_commit_diff_context(
+            "acme/docs",
+            "acme/docs-cn",
+            "base123",
+            "head123",
+            github,
+            self.repo_configs,
+        )
+
+        result = analyze_source_changes(
+            context,
+            github,
+            special_files=["TOC.md", "keywords.md"],
+            ignore_files=[],
+            repo_configs=self.repo_configs,
+            include_formatting_files=True,
+        )
+
+        self.assertIn(file_path, result[1])
+        self.assertEqual({}, result[12])
 
     def test_fenced_hash_comments_are_regular_section_content_changes(self):
         base_content = (

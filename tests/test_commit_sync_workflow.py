@@ -13,6 +13,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import commit_sync_workflow as workflow
+from formatting_sync import build_formatting_only_change
 from translation_structure_validator import StructureValidationIssue
 
 
@@ -2057,6 +2058,7 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             "toc_files": 0,
             "keyword_files": 0,
             "index_files": 1,
+            "formatting_files": 0,
             "modified_sections": 0,
             "added_images": 0,
             "modified_images": 0,
@@ -2072,7 +2074,7 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
                     "source_base_content": "---\n---\n",
                     "source_head_content": "---\n---\n",
                 }
-            }),
+            }, {}),
         ), mock.patch.object(
             workflow,
             "apply_toc_scope_added_files",
@@ -2135,6 +2137,205 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             {"tidb-cloud/dedicated/_index.md"},
         )
         self.assertEqual(result["counts"], zero_counts)
+
+    def test_process_translation_group_applies_formatting_only_without_ai(self):
+        file_path = "tidb-cloud/monitor-alert-slack.md"
+        change_data = build_formatting_only_change(
+            '# Slack\n\n<CustomContent plan="dedicated">\n    \n1. Unsubscribe.\n',
+            '# Slack\n\n<CustomContent plan="dedicated">\n\n1. Unsubscribe.\n',
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch='@@ -3,3 +3,3 @@\n <CustomContent plan="dedicated">\n-    \n+\n 1. Unsubscribe.\n',
+        )
+        analysis_result = (
+            {},
+            {},
+            {},
+            {},
+            [],
+            {},
+            {},
+            [],
+            [],
+            [],
+            set(),
+            {},
+            {file_path: change_data},
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir, file_path)
+            target_path.parent.mkdir(parents=True)
+            target_path.write_text(
+                '# Slack 中文\n\n<CustomContent plan="dedicated">\n    \n1. 取消订阅。\n',
+                encoding="utf-8",
+            )
+            stats = workflow.TranslationStats()
+
+            with mock.patch.object(
+                workflow,
+                "analyze_source_changes",
+                return_value=analysis_result,
+            ), mock.patch.object(
+                workflow,
+                "should_parallelize_file_processing",
+                return_value=False,
+            ), mock.patch.object(
+                workflow,
+                "git_add_successful_task_changes",
+            ), mock.patch.object(
+                workflow,
+                "validate_successful_translation_structures",
+            ), mock.patch.object(
+                workflow,
+                "_process_commit_modified_file",
+                side_effect=AssertionError("regular translation path must not run"),
+            ) as regular_processor:
+                result = workflow.process_translation_group(
+                    "formatting-only",
+                    source_files_translation_mode="incremental",
+                    source_files=file_path,
+                    source_folder="",
+                    diff_context={
+                        "mode": "commit",
+                        "source_repo": "acme/docs",
+                        "target_repo": "acme/docs-cn",
+                        "base_ref": "base",
+                        "head_ref": "head",
+                    },
+                    filtered_changed_files=[changed_file],
+                    pr_diff=changed_file.patch,
+                    github_client=object(),
+                    ai_client=object(),
+                    repo_config={
+                        "source_language": "English",
+                        "target_language": "Chinese",
+                        "target_local_path": tmpdir,
+                    },
+                    repo_configs={},
+                    glossary_matcher=None,
+                    commit_ignore_files=[],
+                    translation_stats=stats,
+                )
+
+            regular_processor.assert_not_called()
+            self.assertEqual({file_path}, result["successful_file_paths"])
+            self.assertEqual(1, result["counts"]["formatting_files"])
+            self.assertEqual([], stats.failed)
+            self.assertIn(
+                '<CustomContent plan="dedicated">\n\n1. 取消订阅。',
+                target_path.read_text(encoding="utf-8"),
+            )
+
+    def test_process_translation_group_uses_ai_mapping_when_target_lines_shift(self):
+        file_path = "tidb-cloud/monitor-alert-slack.md"
+        change_data = build_formatting_only_change(
+            '# Slack\n\n<CustomContent plan="dedicated">\n    \n1. Unsubscribe.\n',
+            '# Slack\n\n<CustomContent plan="dedicated">\n\n1. Unsubscribe.\n',
+        )
+        changed_file = SimpleNamespace(
+            filename=file_path,
+            status="modified",
+            patch='@@ -3,3 +3,3 @@\n <CustomContent plan="dedicated">\n-    \n+\n 1. Unsubscribe.\n',
+        )
+        change_data["source_patch"] = changed_file.patch
+        analysis_result = (
+            {},
+            {},
+            {},
+            {},
+            [],
+            {},
+            {},
+            [],
+            [],
+            [],
+            set(),
+            {},
+            {file_path: change_data},
+        )
+
+        class MappingAI:
+            def __init__(self):
+                self.calls = []
+
+            def chat_completion(self, **kwargs):
+                self.calls.append(kwargs)
+                return '{"mappings":[{"source_line_number":4,"target_line_number":5}]}'
+
+        ai_client = MappingAI()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_path = Path(tmpdir, file_path)
+            target_path.parent.mkdir(parents=True)
+            target_path.write_text(
+                '# Slack 中文\n补充说明。\n\n<CustomContent plan="dedicated">\n'
+                '    \n1. 取消订阅。\n<CustomContent plan="dedicated">\n'
+                '    \n1. 保持订阅。\n',
+                encoding="utf-8",
+            )
+            stats = workflow.TranslationStats()
+
+            with mock.patch.object(
+                workflow,
+                "analyze_source_changes",
+                return_value=analysis_result,
+            ), mock.patch.object(
+                workflow,
+                "should_parallelize_file_processing",
+                return_value=False,
+            ), mock.patch.object(
+                workflow,
+                "git_add_successful_task_changes",
+            ), mock.patch.object(
+                workflow,
+                "validate_successful_translation_structures",
+            ), mock.patch.object(
+                workflow,
+                "_process_commit_modified_file",
+                side_effect=AssertionError("regular translation path must not run"),
+            ) as regular_processor:
+                result = workflow.process_translation_group(
+                    "formatting AI fallback",
+                    source_files_translation_mode="incremental",
+                    source_files=file_path,
+                    source_folder="",
+                    diff_context={
+                        "mode": "commit",
+                        "source_repo": "acme/docs",
+                        "target_repo": "acme/docs-cn",
+                        "base_ref": "base",
+                        "head_ref": "head",
+                    },
+                    filtered_changed_files=[changed_file],
+                    pr_diff=changed_file.patch,
+                    github_client=object(),
+                    ai_client=ai_client,
+                    repo_config={
+                        "source_language": "English",
+                        "target_language": "Chinese",
+                        "target_local_path": tmpdir,
+                    },
+                    repo_configs={},
+                    glossary_matcher=None,
+                    commit_ignore_files=[],
+                    translation_stats=stats,
+                )
+
+            regular_processor.assert_not_called()
+            self.assertEqual(1, len(ai_client.calls))
+            self.assertEqual({file_path}, result["successful_file_paths"])
+            self.assertEqual(1, result["counts"]["formatting_files"])
+            self.assertEqual([], stats.failed)
+            self.assertIn(
+                '<CustomContent plan="dedicated">\n\n1. 取消订阅。',
+                target_path.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                '<CustomContent plan="dedicated">\n    \n1. 保持订阅。',
+                target_path.read_text(encoding="utf-8"),
+            )
 
     def test_translation_stats_writes_failure_report(self):
         stats = workflow.TranslationStats()

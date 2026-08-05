@@ -45,6 +45,7 @@ from image_processor import process_all_images
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
 from file_updater import process_files_in_batches, process_added_sections, process_modified_sections
+from formatting_sync import apply_formatting_only_change_with_ai_fallback
 from toc_processor import process_toc_file
 from keword_processor import process_keyword_file
 from section_matcher import match_source_diff_to_target
@@ -59,7 +60,7 @@ from parallel_file_processor import (
 )
 from special_file_utils import is_index_file_name, is_toc_file_name, path_resource_key
 from workflow_ignore_config import load_workflow_ignore_config
-from workflow_outcome import RunReport
+from workflow_outcome import RunReport, record_file_task_result
 
 # Glossary terms path (optional, defaults to resources/terms.md in the docs repo)
 TERMS_PATH = os.getenv("TERMS_PATH", "")
@@ -999,7 +1000,7 @@ def main():
     
     # Step 2: Analyze source changes with operation categorization
     thread_safe_print(f"\n📊 Step 2: Analyzing source changes...")
-    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files = analyze_source_changes(
+    added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files, formatting_files = analyze_source_changes(
         source_context, github_client,
         special_files=SPECIAL_FILES, 
         ignore_files=PR_MODE_IGNORE_FILES,
@@ -1008,6 +1009,7 @@ def main():
         pr_diff=pr_diff,
         exclude_folders=exclude_folders,
         source_files=[path.strip() for path in SOURCE_FILES.split(",") if path.strip()] if SOURCE_FILES else None,
+        include_formatting_files=True,
     )
     if SOURCE_FILES:
         added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images = filter_docs_by_source_files(
@@ -1023,6 +1025,12 @@ def main():
             modified_images,
             deleted_images,
         )
+        requested_source_files = set(normalize_source_files(SOURCE_FILES))
+        formatting_files = {
+            path: data
+            for path, data in formatting_files.items()
+            if path in requested_source_files
+        }
     # Restructured files were rerouted to added_files by detect_restructured_file()
     # in analyze_source_changes(). They need overwrite_existing=True because the
     # target file already exists.
@@ -1044,6 +1052,7 @@ def main():
         added_images,
         modified_images,
         deleted_images,
+        formatting_files,
     )
     parallel_file_processing = should_parallelize_file_processing(diff_file_count)
     if parallel_file_processing:
@@ -1183,9 +1192,65 @@ def main():
         thread_safe_print(f"   ✅ Keyword files processed")
         git_add_successful_task_changes(keyword_results, TARGET_REPO_PATH)
     
-    # Step 3.4: Process modified files (section-level modifications)
+    # Step 3.4: Process formatting-only files
+    if formatting_files:
+        thread_safe_print(
+            f"\n🧹 Step 3.4: Processing {len(formatting_files)} formatting-only files..."
+        )
+        formatting_tasks = []
+        for file_path, formatting_data in formatting_files.items():
+            def run_formatting_file(path=file_path, data=formatting_data):
+                success, changed, reason, ai_attempted = (
+                    apply_formatting_only_change_with_ai_fallback(
+                        path,
+                        data,
+                        repo_config['target_local_path'],
+                        ai_client,
+                        repo_config['source_language'],
+                        repo_config['target_language'],
+                    )
+                )
+                if ai_attempted and success:
+                    thread_safe_print(
+                        f"   🤖 Used AI-assisted formatting line mapping for {path}"
+                    )
+                elif ai_attempted:
+                    thread_safe_print(
+                        f"   🤖 Attempted AI-assisted formatting line mapping for {path}"
+                    )
+                if not success:
+                    return make_task_result("failure", reason)
+                return make_task_result(
+                    "success",
+                    reason or ("Formatting already synchronized" if not changed else ""),
+                )
+
+            formatting_tasks.append(make_file_task(file_path, run_formatting_file))
+
+        formatting_results = run_file_tasks(
+            formatting_tasks,
+            "formatting-only files",
+            parallel_file_processing,
+        )
+        for result in formatting_results:
+            file_path = result["file_path"]
+            status, reason = record_file_task_result(result, run_report)
+            if status == "success":
+                detail = f": {reason}" if reason else ""
+                thread_safe_print(
+                    f"   ✅ Synchronized formatting for {file_path}{detail}"
+                )
+            elif status == "partial":
+                thread_safe_print(f"   ⚠️  Partially synchronized {file_path}: {reason}")
+            elif status == "skipped":
+                thread_safe_print(f"   ⏭️  Skipped formatting sync for {file_path}: {reason}")
+            else:
+                thread_safe_print(f"   ❌ Failed to synchronize {file_path}: {reason}")
+        git_add_successful_task_changes(formatting_results, TARGET_REPO_PATH)
+
+    # Step 3.5: Process modified files (section-level modifications)
     if modified_sections:
-        thread_safe_print(f"\n📝 Step 3.4: Processing {len(modified_sections)} modified files...")
+        thread_safe_print(f"\n📝 Step 3.5: Processing {len(modified_sections)} modified files...")
 
         modified_tasks = []
         for source_file_path, file_sections in modified_sections.items():
@@ -1235,9 +1300,9 @@ def main():
 
         git_add_successful_task_changes(modified_results, TARGET_REPO_PATH)
     
-    # Step 3.5: Process images (added, modified, deleted)
+    # Step 3.6: Process images (added, modified, deleted)
     if added_images or modified_images or deleted_images:
-        thread_safe_print(f"\n🖼️  Step 3.5: Processing images...")
+        thread_safe_print(f"\n🖼️  Step 3.6: Processing images...")
         image_outcomes = process_all_images(
             added_images,
             modified_images,
@@ -1258,6 +1323,7 @@ def main():
     thread_safe_print(f"   🗑️  Deleted files: {len(deleted_files)} processed")
     thread_safe_print(f"   📋 TOC files: {len(toc_files)} processed")
     thread_safe_print(f"   📋 Keyword files: {len(keyword_files)} processed")
+    thread_safe_print(f"   🧹 Formatting-only files: {len(formatting_files)} processed")
     thread_safe_print(f"   📝 Modified files: {len(modified_sections)} processed")
     thread_safe_print(f"   🖼️  Added images: {len(added_images)} processed")
     thread_safe_print(f"   🖼️  Modified images: {len(modified_images)} processed")
