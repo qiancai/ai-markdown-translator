@@ -244,6 +244,10 @@ class DiffAnalyzerContextTest(unittest.TestCase):
     def test_temporary_japanese_release_rule_requires_aliases_only_diff(self):
         aliases_patch = "\n".join(
             [
+                "diff --git a/releases/release-8.5.0.md b/releases/release-8.5.0.md",
+                "index 1111111..2222222 100644",
+                "--- a/releases/release-8.5.0.md",
+                "+++ b/releases/release-8.5.0.md",
                 "@@ -1,4 +1,4 @@",
                 " ---",
                 "-aliases: ['/old/']",
@@ -260,6 +264,31 @@ class DiffAnalyzerContextTest(unittest.TestCase):
         self.assertTrue(
             should_skip_temporary_japanese_release_alias_change(
                 aliases_only_file,
+                "Japanese",
+            )
+        )
+
+        indented_aliases_file = SimpleNamespace(
+            filename="releases/release-8.5.0.md",
+            status="modified",
+            patch="@@ -10 +10 @@\n-  aliases: old\n+  aliases: new",
+        )
+        self.assertFalse(
+            should_skip_temporary_japanese_release_alias_change(
+                indented_aliases_file,
+                "Japanese",
+            )
+        )
+
+        truncated_patch_file = SimpleNamespace(
+            filename="releases/release-8.5.0.md",
+            status="modified",
+            patch="@@ -1 +1 @@\n+aliases: ['/new/']",
+            changes=2,
+        )
+        self.assertFalse(
+            should_skip_temporary_japanese_release_alias_change(
+                truncated_patch_file,
                 "Japanese",
             )
         )

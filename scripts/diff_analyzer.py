@@ -105,6 +105,7 @@ class DiffFile:
     status: str
     patch: Optional[str] = None
     previous_filename: Optional[str] = None
+    changes: Optional[int] = None
 
 
 def is_diff_context(value):
@@ -119,6 +120,7 @@ def normalize_changed_file(file):
         status=file.status,
         patch=getattr(file, "patch", None),
         previous_filename=getattr(file, "previous_filename", None),
+        changes=getattr(file, "changes", None),
     )
 
 
@@ -282,7 +284,15 @@ def should_skip_temporary_japanese_release_alias_change(file, target_language):
             in_hunk = False
             continue
         if in_hunk and line.startswith(("+", "-")):
-            changed_lines.append(line[1:].strip())
+            # Frontmatter keys are top-level. Preserve leading whitespace so an
+            # indented aliases example in Markdown cannot trigger this rule.
+            changed_lines.append(line[1:].rstrip())
+
+    expected_changes = getattr(file, "changes", None)
+    if isinstance(expected_changes, int) and expected_changes != len(changed_lines):
+        # GitHub can omit or truncate patches. Never skip a file when the patch
+        # does not account for every changed line reported by the API.
+        return False
 
     return bool(changed_lines) and all(
         re.match(r"^aliases\s*:", line) is not None
