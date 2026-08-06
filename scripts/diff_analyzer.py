@@ -105,7 +105,6 @@ class DiffFile:
     status: str
     patch: Optional[str] = None
     previous_filename: Optional[str] = None
-    changes: Optional[int] = None
 
 
 def is_diff_context(value):
@@ -120,7 +119,6 @@ def normalize_changed_file(file):
         status=file.status,
         patch=getattr(file, "patch", None),
         previous_filename=getattr(file, "previous_filename", None),
-        changes=getattr(file, "changes", None),
     )
 
 
@@ -248,56 +246,6 @@ def build_diff_text(changed_files):
             diff_content.append(file.patch)
             diff_content.append("-" * 80)
     return "\n".join(diff_content)
-
-
-def should_skip_temporary_japanese_release_alias_change(file, target_language):
-    """Return True for the temporary Japanese release-note aliases-only case.
-
-    This intentionally stays as a small, self-contained rule so it can be
-    removed after the one-off release-note alias migration is complete.
-    """
-    normalized_language = str(target_language or "").strip().lower().replace("_", "-")
-    if normalized_language not in {"japanese", "ja", "ja-jp", "日本語"}:
-        return False
-
-    filename = str(getattr(file, "filename", "") or "")
-    if filename.startswith("./"):
-        filename = filename[2:]
-    if (
-        getattr(file, "status", "") != "modified"
-        or not filename.startswith("releases/")
-        or not filename.endswith(".md")
-    ):
-        return False
-
-    patch = getattr(file, "patch", None)
-    if not patch:
-        return False
-
-    changed_lines = []
-    in_hunk = False
-    for line in patch.splitlines():
-        if line.startswith("@@"):
-            in_hunk = True
-            continue
-        if line.startswith("diff --git "):
-            in_hunk = False
-            continue
-        if in_hunk and line.startswith(("+", "-")):
-            # Frontmatter keys are top-level. Preserve leading whitespace so an
-            # indented aliases example in Markdown cannot trigger this rule.
-            changed_lines.append(line[1:].rstrip())
-
-    expected_changes = getattr(file, "changes", None)
-    if isinstance(expected_changes, int) and expected_changes != len(changed_lines):
-        # GitHub can omit or truncate patches. Never skip a file when the patch
-        # does not account for every changed line reported by the API.
-        return False
-
-    return bool(changed_lines) and all(
-        re.match(r"^aliases\s*:", line) is not None
-        for line in changed_lines
-    )
 
 
 def build_pr_diff_context(pr_url, github_client, repo_configs):
@@ -3127,29 +3075,6 @@ def analyze_source_changes(
             "📄 SOURCE_FILES early filter applied before diff analysis: "
             f"{', '.join(sorted(requested_source_files))}"
         )
-
-    # Temporary Japanese-only exception for the release-note aliases migration.
-    # Keep this before per-file analysis so skipped files never reach any target
-    # update queue. Remove the helper and this block after the migration week.
-    skipped_release_alias_files = [
-        file
-        for file in markdown_files
-        if should_skip_temporary_japanese_release_alias_change(
-            file,
-            repo_config.get("target_language"),
-        )
-    ]
-    if skipped_release_alias_files:
-        skipped_paths = {file.filename for file in skipped_release_alias_files}
-        markdown_files = [
-            file for file in markdown_files if file.filename not in skipped_paths
-        ]
-        print(
-            "⏭️  Temporary Japanese translation rule: skipped "
-            f"{len(skipped_paths)} aliases-only release-note file(s)"
-        )
-        for path in sorted(skipped_paths):
-            print(f"   - {path}")
 
     # Return dictionaries for different operation types
     added_sections = {}      # New sections that were added
