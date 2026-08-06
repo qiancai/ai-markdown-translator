@@ -10,6 +10,7 @@ import threading
 from github import Github
 from openai import OpenAI
 from log_sanitizer import sanitize_exception_message
+from product_specific_handler import get_product_name
 
 # Thread-safe printing
 print_lock = threading.Lock()
@@ -465,6 +466,8 @@ def get_corresponding_sections(
     source_base_text = format_hierarchy_list_for_prompt(source_base_hierarchy_for_prompt)
     source_head_text = format_hierarchy_list_for_prompt(source_head_hierarchy_for_prompt)
     normalized_source_mode = (source_mode or "").lower()
+    product_name = get_product_name()
+    product_context = f" for {product_name}" if product_name else ""
 
     if source_base_text or source_head_text:
         mode_guidance = (
@@ -477,7 +480,7 @@ def get_corresponding_sections(
             "Do not assume every source section must have a target-language counterpart."
         )
 
-        prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB.
+        prompt = f"""I am aligning the {source_language} and {target_language} documentation{product_context}.
 
 {mode_guidance}
 
@@ -506,7 +509,7 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
 
 {target_text}"""
     else:
-        prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB.
+        prompt = f"""I am aligning the {source_language} and {target_language} documentation{product_context}.
 
 I have modified the following {number_of_sections} section(s) in the {source_language} file:
 
@@ -605,6 +608,8 @@ def get_corresponding_sections_json(
     expected_keys = list(source_sections.keys())
     expected_keys_json = json.dumps(expected_keys, ensure_ascii=False)
     normalized_source_mode = (source_mode or "").lower()
+    product_name = get_product_name()
+    product_context = f" for {product_name}" if product_name else ""
     mode_guidance = (
         "This is commit-based mode. The target file is expected to correspond to the source BASE file. "
         "First align the source BASE section structure to the target-language section structure, then map each changed section by key. "
@@ -616,7 +621,7 @@ def get_corresponding_sections_json(
         "Do not assume every source section must have a target-language counterpart."
     )
 
-    prompt = f"""I am aligning the {source_language} and {target_language} documentation for TiDB.
+    prompt = f"""I am aligning the {source_language} and {target_language} documentation{product_context}.
 
 {mode_guidance}
 

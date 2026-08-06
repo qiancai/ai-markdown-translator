@@ -10,13 +10,13 @@ import re
 import subprocess
 import tiktoken
 from github import Github, Auth
+from product_specific_handler import get_product_name
 
 # Configuration from environment variables
 SOURCE_PR_URL = os.getenv("SOURCE_PR_URL")
 TARGET_PR_URL = os.getenv("TARGET_PR_URL")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek")
-PRODUCT = os.getenv("PRODUCT") or "TiDB"
 TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SKIP_GIT_ADD = os.getenv("SKIP_GIT_ADD", "false").lower() == "true"
@@ -928,7 +928,7 @@ def main():
     thread_safe_print(f"📍 Source PR URL: {SOURCE_PR_URL}")
     thread_safe_print(f"📍 Target PR URL: {TARGET_PR_URL}")
     thread_safe_print(f"🤖 AI Provider: {AI_PROVIDER}")
-    thread_safe_print(f"🏷️  Product: {PRODUCT}")
+    thread_safe_print(f"🏷️  Product: {get_product_name()}")
     thread_safe_print(f"📁 Target Repo Path: {TARGET_REPO_PATH}")
     thread_safe_print(f"📖 Prefer Local Target Read: {PREFER_LOCAL_TARGET_FOR_READ}")
     

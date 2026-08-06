@@ -18,7 +18,7 @@ from heading_anchor_utils import (
     build_heading_anchor_slug,
 )
 from log_sanitizer import sanitize_exception_message, safe_target_path
-from product_specific_handler import rewrite_tidb_version_anchors_in_sections
+from product_specific_handler import get_product_name, rewrite_tidb_version_anchors_in_sections
 from special_file_utils import path_resource_key, source_scope_includes_folder
 from svg_preprocessor import (
     strip_svgs,
@@ -1989,10 +1989,13 @@ def _prepare_translation_prompt(
             glossary_instruction = "\nWhen translating the target content, use the translations of the terms provided below to maintain consistency."
             thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for prompt")
 
+    product_name = get_product_name()
+    documentation_subject = f"{product_name} user documentation" if product_name else "User documentation"
+
     prompt = f"""````markdown
 You are an expert technical writer in the database domain, proficient in writing clear, concise, and easy-to-understand user documentation.
 
-TiDB user documentation is maintained in both {source_language} and {target_language}. Some content in the {source_language} documentation has been updated through a Git diff, and the corresponding content in {target_language} needs to be updated accordingly.
+{documentation_subject} is maintained in both {source_language} and {target_language}. Some content in the {source_language} documentation has been updated through a Git diff, and the corresponding content in {target_language} needs to be updated accordingly.
 
 Your task is to update the target sections in {target_language} according to the Git diff in {source_language}. I will provide:
 - The latest source sections in {source_language}
@@ -2001,7 +2004,13 @@ Your task is to update the target sections in {target_language} according to the
 - The glossary for terms in both languages
 
 CORE PRINCIPLE:
-Treat the Git diff as the ONLY source of truth for determining what needs to be modified in the target content. In the target sections, do not introduce any changes that are not directly changed by the diff. Any content not directly changed by the diff must remain byte-for-byte unchanged in the target language output.
+First determine the operation type of each section:
+- If a section key begins with "added_", classify it as an added section regardless of whether its current target section is empty. The key prefix always takes precedence over target content.
+- Otherwise, classify it as a modified section. Its current target section normally contains existing content.
+
+Then apply the corresponding rule:
+- Added section: Translate the complete latest source section into {target_language}, including natural-language content in unchanged context lines that do not begin with "+" in the Git diff.
+- Modified section: Treat the Git diff as the ONLY source of truth for determining what needs to be modified in the target content. Continue to follow the strict diff-only rules below and preserve target content that is not changed by the diff byte-for-byte.
 
 Instructions:
 
@@ -2011,10 +2020,10 @@ Instructions:
      - Added or updated source lines (beginning with "+")
      - Removed or replaced source lines (beginning with "-")
      - Unchanged context lines (Lines without diff markers)
-   - Only lines that are changed in the diff are eligible for modification in the target language.
-   - Unchanged context lines are NOT eligible for any modification in the target language.
+   - In modified sections, only lines that are changed in the diff are eligible for modification in the target language.
+   - In modified sections, unchanged context lines are NOT eligible for any modification in the target language.
 
-2. Apply STRICT minimal edits in {target_language}
+2. Apply STRICT minimal edits in modified sections in {target_language}
    - Update ONLY the target-language content corresponding to actual changed source-language content.
    - Modify only the minimum necessary text required by the diff.
    - Do NOT rewrite entire paragraphs, lists, or sections if only a small fragment changed.
@@ -2022,11 +2031,11 @@ Instructions:
      - Modify only the sentence fragments required by the diff
      - Preserve all other text exactly as-is
 
-3. For lines not included in the diff or the unchanged context lines in the diff, do not modify them in {target_language}, which means:
+3. In modified sections, for lines not included in the diff or the unchanged context lines in the diff, do not modify them in {target_language}, which means:
      - Do not retranslate them.
      - Do not normalize whitespace or punctuation.
      - Do not adjust terminology.
-     - Even if the translation of an unchanged line in {source_language} is not included in the target section, do not added that line to the target section unless the corresponding source line appears as an added line (lines beginning with "+") in the Git diff.
+     - Even if the translation of an unchanged line in {source_language} is not included in the target section, do not add that line to the target section unless the corresponding source line appears as an added line (lines beginning with "+") in the Git diff.
      - Even if the current translation of an unchanged line in {source_language} does not perfectly match the latest source content, leave it unchanged in the target section unless the corresponding source line appears as an added line (lines beginning with "+") in the Git diff.
 
 4. For changed lines in {source_language}, follow the translation rules below:
@@ -2035,11 +2044,10 @@ Instructions:
     - Do NOT translate:
         - Code examples, SQL queries, configuration values, doc variables/placeholders such as {DOC_VARIABLE_EXAMPLE}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
         - Explicit heading anchors such as {{#example-test}} in the section titles.
-        - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
         - Preserve HTML/MDX component tags exactly, including tag names, attributes, and closing tags, such as <CustomContent plan="premium"> and </CustomContent>.
         - File paths, URLs, and command line examples
         - Variable names and system configuration parameters
-        - Some text wrapped in ** (such as **Create Resource** on the **My TiDB** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
+        - Some text wrapped in ** (such as **Create Resource** on the **Project** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
     - Maintain the exact structure and indentation
     - Keep all special characters and formatting intact
     - {glossary_instruction}
@@ -2049,9 +2057,10 @@ Instructions:
 6. Conflict-resolution priority
 
     When rules conflict, follow this priority order:
-    1. Preserve unchanged target content exactly
-    2. Apply minimal edits in {target_language} according to specifically changed lines in {target_language}
-    3. Maintain valid syntax/formatting
+    1. Translate added sections completely according to the added-section rule in the CORE PRINCIPLE
+    2. Preserve unchanged target content in modified sections exactly
+    3. Apply minimal edits in {target_language} according to specifically changed lines in {source_language}
+    4. Maintain valid syntax/formatting
 
 Input:
 

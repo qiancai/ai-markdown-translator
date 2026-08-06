@@ -27,6 +27,10 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  # Replace this placeholder with the product name used in your documentation.
+  PRODUCT: "Your Product Name"
+
 jobs:
   sync-docs:
     runs-on: ubuntu-latest

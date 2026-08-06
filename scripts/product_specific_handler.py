@@ -5,6 +5,8 @@ Product-specific post-processing helpers for translation output.
 import os
 import re
 
+# Fallback when the PRODUCT environment variable is unset or blank.
+DEFAULT_PRODUCT_NAME = ""
 
 TIDB_ZH_VERSION_ANCHOR_RE = re.compile(
     r'#(?P<prefix>[^)\s#]*?)-从-(?P<version>v\d{2,3})-版本开始引入'
@@ -15,14 +17,15 @@ TIDB_EN_VERSION_ANCHOR_RE = re.compile(
 MARKDOWN_LINK_RE = re.compile(r'(?<!!)\[([^\]]+)\]\(([^)]+)\)')
 
 
-def get_product():
-    """Return the configured product name, defaulting to TiDB."""
-    return os.getenv("PRODUCT") or "TiDB"
+def get_product_name():
+    """Return the configured product name, or an empty string when omitted."""
+    configured_name = (os.getenv("PRODUCT") or "").strip()
+    return configured_name or DEFAULT_PRODUCT_NAME
 
 
 def should_apply_tidb_version_anchor_rewrite(source_language, target_language, source_mode=""):
     """Return True when PR-mode TiDB version anchors should be normalized."""
-    if get_product().strip().lower() != "tidb":
+    if get_product_name().lower() != "tidb":
         return False
     if (source_mode or "").lower() != "pr":
         return False

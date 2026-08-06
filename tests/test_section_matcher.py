@@ -1,6 +1,8 @@
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -8,6 +10,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from section_matcher import (
     batch_match_sections_with_ai,
+    get_corresponding_sections,
+    get_corresponding_sections_json,
     is_direct_match_candidate,
     is_system_variable_or_config,
     match_source_diff_to_target,
@@ -29,6 +33,76 @@ class FakeAIClient:
 
 
 class SectionMatcherRegressionTest(unittest.TestCase):
+    def capture_ai_mapping_prompts(self):
+        ai_client = FakeAIClient(
+            [
+                "```\n## Target\n```",
+                "```\n## Target\n```",
+                '```json\n{"modified_1": "## Target"}\n```',
+            ]
+        )
+
+        get_corresponding_sections(
+            ["## Source"],
+            ["## Target"],
+            ai_client,
+            "English",
+            "Japanese",
+        )
+        get_corresponding_sections(
+            {"modified_1": "## Source"},
+            ["## Target"],
+            ai_client,
+            "English",
+            "Japanese",
+            source_base_hierarchy={1: "## Source"},
+            source_head_hierarchy={1: "## Source"},
+            source_diff_dict={
+                "modified_1": {
+                    "operation": "modified",
+                    "new_content": "## Source",
+                }
+            },
+            source_mode="commit",
+        )
+        get_corresponding_sections_json(
+            {"modified_1": "## Source"},
+            {1: "## Target"},
+            ai_client,
+            {
+                "source_language": "English",
+                "target_language": "Japanese",
+            },
+            source_base_hierarchy={1: "## Source"},
+            source_head_hierarchy={1: "## Source"},
+            source_diff_dict={
+                "modified_1": {
+                    "operation": "modified",
+                    "new_content": "## Source",
+                }
+            },
+            source_mode="commit",
+        )
+        return ai_client.prompts
+
+    def test_ai_mapping_prompts_use_configured_product_name(self):
+        with mock.patch.dict(os.environ, {"PRODUCT": "ExampleDB"}, clear=False):
+            prompts = self.capture_ai_mapping_prompts()
+
+        self.assertEqual(len(prompts), 3)
+        for prompt in prompts:
+            self.assertIn("documentation for ExampleDB", prompt)
+            self.assertNotIn("documentation for TiDB", prompt)
+
+    def test_ai_mapping_prompts_use_product_neutral_wording_when_unset(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            prompts = self.capture_ai_mapping_prompts()
+
+        self.assertEqual(len(prompts), 3)
+        for prompt in prompts:
+            self.assertIn("English and Japanese documentation.", prompt)
+            self.assertNotIn("documentation for .", prompt)
+
     def build_target_fixture(self):
         target_lines = [
             "# 集成 TiDB 向量搜索与 Jina AI Embeddings API",

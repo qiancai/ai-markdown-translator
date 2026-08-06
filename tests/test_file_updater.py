@@ -28,6 +28,7 @@ from file_updater import (
 )
 from ai_client import CompletionText
 from product_specific_handler import (
+    get_product_name,
     rewrite_tidb_version_anchors_in_sections,
     rewrite_tidb_version_anchors_in_text,
 )
@@ -288,7 +289,7 @@ class FileUpdaterRegressionTest(unittest.TestCase):
 
         self.assertEqual(processed, text)
 
-    def test_tidb_version_anchor_rewrite_defaults_to_tidb_product(self):
+    def test_tidb_version_anchor_rewrite_is_disabled_when_product_is_unset(self):
         text = (
             "See [`tidb_enable_x`](/system-variables.md"
             "#tidb-enable-x-从-v800-版本开始引入)."
@@ -302,12 +303,9 @@ class FileUpdaterRegressionTest(unittest.TestCase):
                 source_mode="pr",
             )
 
-        self.assertEqual(
-            processed,
-            "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
-        )
+        self.assertEqual(processed, text)
 
-    def test_tidb_version_anchor_rewrite_defaults_blank_product_to_tidb(self):
+    def test_tidb_version_anchor_rewrite_is_disabled_when_product_is_blank(self):
         text = (
             "See [`tidb_enable_x`](/system-variables.md"
             "#tidb-enable-x-从-v800-版本开始引入)."
@@ -321,10 +319,21 @@ class FileUpdaterRegressionTest(unittest.TestCase):
                 source_mode="pr",
             )
 
-        self.assertEqual(
-            processed,
-            "See [`tidb_enable_x`](/system-variables.md#tidb-enable-x-new-in-v800).",
-        )
+        self.assertEqual(processed, text)
+
+    def test_product_name_strips_whitespace_and_defaults_to_empty(self):
+        with mock.patch.dict(
+            os.environ,
+            {"PRODUCT": "  TiDB Cloud  "},
+            clear=False,
+        ):
+            self.assertEqual(get_product_name(), "TiDB Cloud")
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "   "}, clear=False):
+            self.assertEqual(get_product_name(), "")
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(get_product_name(), "")
 
     def test_tidb_version_anchor_rewrite_only_updates_markdown_link_urls(self):
         text = (
@@ -468,6 +477,134 @@ class FileUpdaterRegressionTest(unittest.TestCase):
         self.assertIn("Preserve HTML/MDX component tags exactly", prompt)
         self.assertIn('<CustomContent plan="premium">', prompt)
         self.assertIn("</CustomContent>", prompt)
+
+    def test_translation_prompt_distinguishes_added_and_modified_sections(self):
+        prompt, _ = _prepare_translation_prompt(
+            "\n".join(
+                [
+                    "File: example.md",
+                    "@@ -1,2 +1,5 @@",
+                    "+#### New section",
+                    " | Privilege | Scope |",
+                    "-Old text.",
+                    "+New text.",
+                ]
+            ),
+            {
+                "added_10": (
+                    "#### New section\n\n"
+                    "| Privilege | Scope |\n"
+                    "|:--|:--|\n"
+                    "| `SELECT` | Tables |\n"
+                ),
+                "modified_20": "### Existing section\n\nNew text.\n",
+            },
+            {
+                "added_10": "",
+                "modified_20": "### Existing section\n\nOld target text.\n",
+            },
+            "English",
+            "Japanese",
+            "commit",
+        )
+
+        core_principle = "CORE PRINCIPLE:"
+        self.assertIn(core_principle, prompt)
+        self.assertIn(
+            'If a section key begins with "added_", classify it as an added section',
+            prompt,
+        )
+        self.assertIn(
+            "regardless of whether its current target section is empty",
+            prompt,
+        )
+        self.assertIn(
+            "The key prefix always takes precedence over target content",
+            prompt,
+        )
+        self.assertIn(
+            "Otherwise, classify it as a modified section",
+            prompt,
+        )
+        self.assertIn(
+            "Added section: Translate the complete latest source section into Japanese",
+            prompt,
+        )
+        self.assertIn(
+            'including natural-language content in unchanged context lines that do not begin with "+"',
+            prompt,
+        )
+        self.assertIn(
+            "Modified section: Treat the Git diff as the ONLY source of truth",
+            prompt,
+        )
+        self.assertIn(
+            "Continue to follow the strict diff-only rules below",
+            prompt,
+        )
+        self.assertIn(
+            "Translate added sections completely according to the added-section rule in the CORE PRINCIPLE",
+            prompt,
+        )
+        self.assertIn(
+            "Apply minimal edits in Japanese according to specifically changed lines in English",
+            prompt,
+        )
+        self.assertNotIn(
+            "Apply minimal edits in Japanese according to specifically changed lines in Japanese",
+            prompt,
+        )
+        operation_detection = "First determine the operation type of each section:"
+        operation_rules = "Then apply the corresponding rule:"
+        self.assertLess(prompt.index(core_principle), prompt.index(operation_detection))
+        self.assertLess(prompt.index(operation_detection), prompt.index(operation_rules))
+        self.assertLess(prompt.index(operation_rules), prompt.index("Instructions:"))
+
+    def test_translation_prompt_uses_configured_product_name(self):
+        with mock.patch.dict(os.environ, {"PRODUCT": "ExampleDB"}, clear=False):
+            prompt, _ = _prepare_translation_prompt(
+                "File: example.md\n@@ -1,1 +1,1 @@\n-old\n+new",
+                {"modified_1": "New source content."},
+                {"modified_1": "Existing target content."},
+                "English",
+                "Japanese",
+                "commit",
+            )
+
+        self.assertIn("ExampleDB user documentation is maintained", prompt)
+        self.assertIn("**Project** page", prompt)
+        self.assertNotIn("TiDB user documentation is maintained", prompt)
+
+    def test_translation_prompt_uses_product_neutral_wording_when_unset(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            prompt, _ = _prepare_translation_prompt(
+                "File: example.md\n@@ -1,1 +1,1 @@\n-old\n+new",
+                {"modified_1": "New source content."},
+                {"modified_1": "Existing target content."},
+                "English",
+                "Japanese",
+                "commit",
+            )
+
+        self.assertIn("User documentation is maintained", prompt)
+        self.assertNotIn("TiDB user documentation", prompt)
+        self.assertNotIn("\n user documentation", prompt)
+
+    def test_added_section_key_takes_precedence_over_nonempty_target_content(self):
+        prompt, _ = _prepare_translation_prompt(
+            "File: example.md\n@@ -1,0 +1,1 @@\n+## New section",
+            {"added_1": "## New section\n\nNew source content.\n"},
+            {"added_1": "## Existing target section\n\nStale content.\n"},
+            "English",
+            "Japanese",
+            "commit",
+        )
+
+        self.assertIn(
+            "The key prefix always takes precedence over target content",
+            prompt,
+        )
+        self.assertIn('"added_1": "## Existing target section', prompt)
 
     def test_prompt_applies_the_same_changed_heading_anchor_to_source_and_diff(self):
         pr_diff = "\n".join(

@@ -352,9 +352,8 @@ def translate_index_lines(
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL HTML-like tags, their attribute names, and their structure exactly. Only translate the values of translatable attributes (title, subTitle, label).
 2. For markdown link lines like [Display Text](URL), translate only the display text inside brackets. Keep the URL unchanged.
-3. Keep product names (TiDB, TiDB Cloud, TiFlash, etc.) unchanged.
-4. Preserve all formatting, indentation, and blank lines exactly.
-5. Keep URLs, anchors, and technical identifiers unchanged.{glossary_instruction}
+3. Preserve all formatting, indentation, and blank lines exactly.
+4. Keep URLs, anchors, and technical identifiers unchanged.{glossary_instruction}
 
 Input lines to translate:
 {json.dumps(content_dict, indent=2, ensure_ascii=False)}

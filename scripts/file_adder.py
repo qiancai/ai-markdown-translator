@@ -12,7 +12,7 @@ from openai import OpenAI
 from file_io import atomic_write_text
 from log_sanitizer import sanitize_exception_message, safe_target_path
 from workflow_outcome import FileOutcomes
-from product_specific_handler import rewrite_tidb_version_anchors_in_text
+from product_specific_handler import get_product_name, rewrite_tidb_version_anchors_in_text
 from svg_preprocessor import strip_svgs, restore_svgs
 
 # Thread-safe printing
@@ -309,6 +309,8 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
             thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for batch translation")
 
     doc_variable_example = "{{{ .starter }}}"
+    product_name = get_product_name()
+    document_description = f"{product_name} document" if product_name else "document"
 
     context_block = ""
     if context_reference and context_reference.strip():
@@ -330,7 +332,7 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
 
     prompt = f"""You are an expert technical writer in the database domain, proficient in writing clear, concise, and easy-to-understand user documentation.
 
-Your task is to translate the following TiDB document content from {source_language} to {target_language}.
+Your task is to translate the following {document_description} content from {source_language} to {target_language}.
 
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
@@ -338,10 +340,9 @@ IMPORTANT INSTRUCTIONS:
    - Code examples, SQL queries, configuration values, doc variables/placeholders such as {doc_variable_example}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
    - `<CustomContent ...>` and `</CustomContent>` tags. Preserve each tag, its attributes, and its placement exactly, while translating natural-language text inside inline `CustomContent` normally.
    - Explicit anchors such as {{#example-test}} in the section titles.
-   - Technical terms like "TiDB", "TiKV", "PD", API names, etc.
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters
-   - Some text wrapped in ** (such as **Create Resource** on the **My TiDB** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
+   - Some text wrapped in ** (such as **Create Resource** on the **Project** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
 3. Translate only the descriptive text and explanations (for such content, you can rewrite it from {source_language} to {target_language} in a more natural and fluent way without changing its original meaning).
 
     - If the {target_language} is English, use title case for #-level titles and sentence case for titles at ## level or deeper. Otherwise, skip this rule.

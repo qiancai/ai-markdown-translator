@@ -22,6 +22,48 @@ from ai_client import CompletionText
 
 
 class FileAdderRegressionTest(unittest.TestCase):
+    def test_translation_prompt_uses_configured_product_name(self):
+        class CapturingAIClient:
+            def __init__(self):
+                self.prompt = ""
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompt = messages[0]["content"]
+                return "翻译后的内容。"
+
+        ai_client = CapturingAIClient()
+        with mock.patch.dict(os.environ, {"PRODUCT": "ExampleDB"}, clear=False):
+            translate_file_batch(
+                "Source content.\n",
+                ai_client,
+                source_language="English",
+                target_language="Chinese",
+            )
+
+        self.assertIn("the following ExampleDB document content", ai_client.prompt)
+        self.assertNotIn("the following document content", ai_client.prompt)
+
+    def test_translation_prompt_uses_product_neutral_wording_when_unset(self):
+        class CapturingAIClient:
+            def __init__(self):
+                self.prompt = ""
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompt = messages[0]["content"]
+                return "翻译后的内容。"
+
+        ai_client = CapturingAIClient()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            translate_file_batch(
+                "Source content.\n",
+                ai_client,
+                source_language="English",
+                target_language="Chinese",
+            )
+
+        self.assertIn("the following document content", ai_client.prompt)
+        self.assertNotIn("the following  document content", ai_client.prompt)
+
     def test_trailing_batch_newlines_do_not_trigger_truncation_warning(self):
         class FakeAIClient:
             def chat_completion(self, messages, temperature=0.1):

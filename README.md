@@ -100,6 +100,16 @@ The dependency file uses exact versions so local runs and GitHub Actions use the
 
 Set the variables for the mode you want to run.
 
+#### Product name (both modes)
+
+Optionally set `PRODUCT` to the product name that the translator should use in its AI prompts:
+
+```bash
+export PRODUCT="Your Product Name"
+```
+
+`PRODUCT` applies to both PR mode and commit-based mode. Leading and trailing whitespace is removed. If the variable is unset, empty, or contains only whitespace, the translator uses product-neutral prompt wording and skips product-specific post-processing. The empty fallback is defined as `DEFAULT_PRODUCT_NAME` in `scripts/product_specific_handler.py`.
+
 #### PR mode (`main_workflow.py`)
 
 ```bash
@@ -265,6 +275,7 @@ scripts/
 ├── diff_analyzer.py        # Shared PR and commit-range diff analysis
 ├── section_matcher.py      # Direct and AI-assisted section matching
 ├── glossary.py             # Glossary loading, filtering, and prompt formatting
+├── product_specific_handler.py # Product-name configuration and product-specific output rewrites
 ├── file_adder.py           # New-file translation
 ├── file_deleter.py         # Deleted-file processing
 ├── file_updater.py         # Incremental section translation and update

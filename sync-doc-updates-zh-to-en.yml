@@ -24,6 +24,8 @@ on:
 
 env:
   # ─── Repo & branch configuration (customize per product) ───
+  # Replace this placeholder with the product name used in your documentation.
+  PRODUCT: "Your Product Name"
   SOURCE_REPO: ${{ github.repository }}
   SOURCE_BRANCH: main
   TARGET_BRANCH: i18n-en-main

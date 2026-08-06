@@ -16,6 +16,18 @@ import main_workflow
 
 
 class MainWorkflowImageOnlyPrTest(unittest.TestCase):
+    def test_product_name_is_resolved_from_environment_at_runtime(self):
+        self.assertFalse(hasattr(main_workflow, "PRODUCT"))
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(main_workflow.get_product_name(), "")
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "First Product"}, clear=False):
+            self.assertEqual(main_workflow.get_product_name(), "First Product")
+
+        with mock.patch.dict(os.environ, {"PRODUCT": "Second Product"}, clear=False):
+            self.assertEqual(main_workflow.get_product_name(), "Second Product")
+
     def test_unknown_provider_does_not_break_module_import(self):
         env = os.environ.copy()
         env["AI_PROVIDER"] = "azureopenai"
