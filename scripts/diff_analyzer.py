@@ -5,6 +5,7 @@ Handles diff analysis, content retrieval, hierarchy building, and section extrac
 for both PR-based and commit-compare-based workflows.
 """
 
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass
 import difflib
@@ -662,17 +663,30 @@ def analyze_diff_operations(file, base_content=None, head_content=None):
         return operations
     
     lines = patch.split('\n')
+    hunk_start_by_diff_index = []
+    current_hunk_start = None
+    for diff_index, diff_line in enumerate(lines):
+        if diff_line.startswith('@@'):
+            current_hunk_start = diff_index
+        hunk_start_by_diff_index.append(current_hunk_start)
+
     current_line = 0
     deleted_line = 0
     
     # Parse diff and keep track of sequence order for better modification detection
     diff_sequence = []  # Track the order of operations in diff
     in_hunk = False  # Track whether we've seen the first @@ hunk header
+    base_snapshot_hierarchy = (
+        build_hierarchy_dict(base_content) if base_content is not None else None
+    )
+    head_snapshot_hierarchy = (
+        build_hierarchy_dict(head_content) if head_content is not None else None
+    )
     base_heading_lines = (
-        set(build_hierarchy_dict(base_content)) if base_content is not None else None
+        set(base_snapshot_hierarchy) if base_snapshot_hierarchy is not None else None
     )
     head_heading_lines = (
-        set(build_hierarchy_dict(head_content)) if head_content is not None else None
+        set(head_snapshot_hierarchy) if head_snapshot_hierarchy is not None else None
     )
     
     for i, line in enumerate(lines):
@@ -873,6 +887,280 @@ def analyze_diff_operations(file, base_content=None, head_content=None):
             return True
             
         return False
+
+    def is_adjacent_structural_rename(deleted_header, added_header):
+        """Return whether the established adjacency rule pairs two headings."""
+        return (
+            abs(added_header["diff_index"] - deleted_header["diff_index"]) <= 5
+            and heading_level(deleted_header["content"])
+            == heading_level(added_header["content"])
+            and not has_intervening_heading(deleted_header, added_header)
+            and not is_likely_header_batch_boundary(deleted_header, added_header)
+        )
+
+    base_snapshot_lines = (
+        split_normalized_lines(base_content) if base_content is not None else None
+    )
+    head_snapshot_lines = (
+        split_normalized_lines(head_content) if head_content is not None else None
+    )
+    base_section_body_cache = {}
+    head_section_body_cache = {}
+    added_header_diff_indices = [
+        header["diff_index"] for header in added_headers
+    ]
+
+    def normalized_section_body_counter(snapshot_lines, header, cache):
+        """Return cached meaningful-line counts for one source section body."""
+        if snapshot_lines is None:
+            return Counter(), 0
+
+        line_number = header["line_number"]
+        if line_number in cache:
+            return cache[line_number]
+
+        section = extract_section_direct_content(
+            snapshot_lines,
+            line_number,
+        )
+        if not section:
+            cache[line_number] = (Counter(), 0)
+            return cache[line_number]
+
+        normalized = []
+        for raw_line in section.splitlines()[1:]:
+            line = re.sub(r"\s+", " ", raw_line.strip()).casefold()
+            meaningful = re.sub(r"[\W_]+", "", line, flags=re.UNICODE)
+            if len(meaningful) >= 12:
+                normalized.append(line)
+        cache[line_number] = (Counter(normalized), len(normalized))
+        return cache[line_number]
+
+    def section_body_continuity(deleted_header, added_header):
+        """Measure exact unchanged-line continuity between BASE and HEAD sections."""
+        old_line_counts, old_line_count = normalized_section_body_counter(
+            base_snapshot_lines,
+            deleted_header,
+            base_section_body_cache,
+        )
+        new_line_counts, new_line_count = normalized_section_body_counter(
+            head_snapshot_lines,
+            added_header,
+            head_section_body_cache,
+        )
+        if not old_line_count or not new_line_count:
+            return 0, 0.0
+
+        shared_count = sum((old_line_counts & new_line_counts).values())
+        shared_ratio = shared_count / min(old_line_count, new_line_count)
+        return shared_count, shared_ratio
+
+    def hierarchy_parent(hierarchy):
+        if not hierarchy or " > " not in hierarchy:
+            return ()
+        return tuple(
+            clean_title_for_matching(part)
+            for part in hierarchy.split(" > ")[:-1]
+        )
+
+    def headers_have_compatible_parents(deleted_header, added_header):
+        if base_snapshot_hierarchy is None or head_snapshot_hierarchy is None:
+            return False
+        old_hierarchy = base_snapshot_hierarchy.get(deleted_header["line_number"])
+        new_hierarchy = head_snapshot_hierarchy.get(added_header["line_number"])
+        if old_hierarchy is None or new_hierarchy is None:
+            return False
+        return hierarchy_parent(old_hierarchy) == hierarchy_parent(new_hierarchy)
+
+    def has_intervening_unchanged_boundary_heading(deleted_header, added_header):
+        """Return True at an unchanged same/higher-level section boundary."""
+        deleted_level = heading_level(deleted_header["content"])
+        if deleted_level is None:
+            return True
+        start = deleted_header["diff_index"] + 1
+        end = added_header["diff_index"]
+        for raw_line in lines[start:end]:
+            if not raw_line.startswith(" "):
+                continue
+            stable_level = heading_level(raw_line[1:].strip())
+            if stable_level is not None and stable_level <= deleted_level:
+                return True
+        return False
+
+    def iter_added_headers_in_diff_range(first_diff_index, last_diff_index):
+        """Yield added headings within an inclusive diff-index range."""
+        start = bisect_left(added_header_diff_indices, first_diff_index)
+        end = bisect_right(added_header_diff_indices, last_diff_index)
+        for added_index in range(start, end):
+            yield added_index, added_headers[added_index]
+
+    def high_confidence_continuation_candidates(deleted_header):
+        """Find HEAD headings that clearly continue one BASE section.
+
+        A later semantic match can be the real continuation when an unrelated
+        section was inserted immediately before it. Require both heading
+        similarity and exact body-line continuity so ordinary arbitrary
+        renames keep using the established adjacent-heading fallback.
+        """
+        if base_snapshot_lines is None or head_snapshot_lines is None:
+            return []
+
+        old_title = deleted_header["content"].strip()
+        old_level = heading_level(old_title)
+        old_diff_index = deleted_header["diff_index"]
+        old_hunk = hunk_start_by_diff_index[old_diff_index]
+        candidates = []
+
+        for added_index, added_header in iter_added_headers_in_diff_range(
+            old_diff_index + 1,
+            old_diff_index + 200,
+        ):
+            if hunk_start_by_diff_index[added_header["diff_index"]] != old_hunk:
+                continue
+            if has_intervening_unchanged_boundary_heading(
+                deleted_header,
+                added_header,
+            ):
+                continue
+            if not headers_have_compatible_parents(deleted_header, added_header):
+                continue
+
+            new_title = added_header["content"].strip()
+            exact_title = normalize_heading_title(old_title) == normalize_heading_title(
+                new_title
+            )
+            if heading_level(new_title) != old_level and not exact_title:
+                continue
+            if not are_headers_similar(old_title, new_title):
+                continue
+
+            shared_count, shared_ratio = section_body_continuity(
+                deleted_header,
+                added_header,
+            )
+            if shared_count < 2 or shared_ratio < 0.25:
+                continue
+
+            candidates.append(
+                {
+                    "added_index": added_index,
+                    "added_header": added_header,
+                    "exact_title": exact_title,
+                    "shared_count": shared_count,
+                    "shared_ratio": shared_ratio,
+                }
+            )
+
+        return candidates
+
+    def choose_unique_continuation(candidates):
+        if not candidates:
+            return None
+
+        ranked = sorted(
+            candidates,
+            key=lambda candidate: (
+                1 if candidate["exact_title"] else 0,
+                candidate["shared_ratio"],
+                candidate["shared_count"],
+            ),
+            reverse=True,
+        )
+        if len(ranked) == 1:
+            return ranked[0]
+
+        best = ranked[0]
+        runner_up = ranked[1]
+        clearly_better = (
+            best["exact_title"] and not runner_up["exact_title"]
+        ) or (
+            best["shared_ratio"] >= runner_up["shared_ratio"] + 0.20
+        ) or (
+            best["shared_count"] >= runner_up["shared_count"] + 2
+            and best["shared_ratio"] > runner_up["shared_ratio"]
+        )
+        return best if clearly_better else None
+
+    def adjacent_structural_fallback(deleted_header):
+        """Return the candidate selected by the established adjacency rule."""
+        old_diff_index = deleted_header["diff_index"]
+        for _, added_header in iter_added_headers_in_diff_range(
+            old_diff_index - 5,
+            old_diff_index + 5,
+        ):
+            if is_adjacent_structural_rename(deleted_header, added_header):
+                return added_header
+        return None
+
+    def continuation_clearly_beats_fallback(candidate, deleted_header):
+        """Avoid overriding a plausible adjacent arbitrary heading rename."""
+        fallback = adjacent_structural_fallback(deleted_header)
+        if (
+            fallback is None
+            or fallback["diff_index"] == candidate["added_header"]["diff_index"]
+        ):
+            return True
+
+        fallback_count, fallback_ratio = section_body_continuity(
+            deleted_header,
+            fallback,
+        )
+        if fallback_count < 2 or fallback_ratio < 0.25:
+            return True
+
+        fallback_exact_title = normalize_heading_title(
+            deleted_header["content"]
+        ) == normalize_heading_title(fallback["content"])
+        if candidate["exact_title"] and not fallback_exact_title:
+            return True
+
+        return (
+            candidate["shared_ratio"] >= fallback_ratio + 0.20
+            or (
+                candidate["shared_count"] >= fallback_count + 2
+                and candidate["shared_ratio"] > fallback_ratio
+            )
+        )
+
+    # First pair only unique, high-confidence section continuations. Collect
+    # proposals before claiming headings so repeated sections cannot greedily
+    # steal the same target from each other.
+    continuation_proposals = {}
+    for deleted_index, deleted_header in enumerate(deleted_headers):
+        candidate = choose_unique_continuation(
+            high_confidence_continuation_candidates(deleted_header)
+        )
+        if candidate is not None and continuation_clearly_beats_fallback(
+            candidate,
+            deleted_header,
+        ):
+            continuation_proposals[deleted_index] = candidate
+
+    claimed_candidate_counts = Counter(
+        proposal["added_index"]
+        for proposal in continuation_proposals.values()
+    )
+    for deleted_index, proposal in continuation_proposals.items():
+        added_index = proposal["added_index"]
+        if claimed_candidate_counts[added_index] != 1:
+            continue
+
+        deleted_header = deleted_headers[deleted_index]
+        added_header = proposal["added_header"]
+        modified_pairs.append({
+            'deleted': deleted_header,
+            'added': added_header,
+            'original_content': deleted_header['content']
+        })
+        used_deleted_indices.add(deleted_index)
+        used_added_indices.add(added_index)
+        thread_safe_print(
+            "   🧭 Preferred section-continuity heading match: "
+            f"{deleted_header['content'].strip()} -> "
+            f"{added_header['content'].strip()} "
+            f"({proposal['shared_count']} shared body lines, "
+            f"{proposal['shared_ratio']:.0%} continuity)"
+        )
     
     # GitHub-like approach: Look for adjacent or close operations in diff sequence
     for i, deleted_header in enumerate(deleted_headers):
@@ -890,13 +1178,9 @@ def analyze_diff_operations(file, base_content=None, head_content=None):
             diff_distance = abs(added_header['diff_index'] - deleted_header['diff_index'])
             is_close_in_diff = diff_distance <= 5  # Allow small gap for context lines
 
-            same_heading_level = heading_level(deleted_content) == heading_level(added_content)
-            has_no_intervening_heading = not has_intervening_heading(deleted_header, added_header)
-            is_batch_boundary = is_likely_header_batch_boundary(deleted_header, added_header)
-            is_structural_rename = (
-                same_heading_level
-                and has_no_intervening_heading
-                and not is_batch_boundary
+            is_structural_rename = is_adjacent_structural_rename(
+                deleted_header,
+                added_header,
             )
             
             # Check semantic similarity

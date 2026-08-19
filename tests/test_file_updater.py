@@ -15,6 +15,7 @@ from file_updater import (
     REGULAR_TRANSLATION_CHUNK_SIZE,
     TRANSLATION_CHUNK_MAX_SECTIONS,
     TranslationResult,
+    _find_suspicious_duplicate_changed_bodies,
     _prepare_translation_prompt,
     build_heading_anchor_slug,
     build_translation_chunks,
@@ -35,6 +36,143 @@ from product_specific_handler import (
 
 
 class FileUpdaterRegressionTest(unittest.TestCase):
+    def test_long_duplicate_target_bodies_with_distinct_sources_are_rejected(self):
+        duplicated_target_body = "\n\n".join(
+            [
+                "启用审计日志后，你必须指定审计过滤规则。",
+                "配置 SQL 用户以及需要记录的过滤事件。",
+                "点击确认以添加过滤规则。",
+                "建议限制审计日志范围以减少资源使用。",
+            ]
+        ) * 5
+        match_data = {
+            "modified_254": {
+                "source_operation": "modified",
+                "source_new_content": (
+                    "## Configure database audit logging settings\n\n"
+                    "Configure rotation by file size or time.\n\n"
+                    "Enable log redaction and save the settings.\n\n"
+                    "Disabling redaction can expose sensitive information.\n"
+                ),
+                "target_new_content": (
+                    "## 配置数据库审计日志记录设置\n\n"
+                    f"{duplicated_target_body}"
+                ),
+            },
+            "added_272": {
+                "source_operation": "added",
+                "source_new_content": (
+                    "## Specify audit filter rules\n\n"
+                    "Add a filter name.\n\n"
+                    "Select SQL users and filter events.\n\n"
+                    "Confirm the filter rule.\n"
+                ),
+                "target_new_content": (
+                    "## 指定审计过滤规则\n\n"
+                    f"{duplicated_target_body}"
+                ),
+            },
+        }
+
+        issues = _find_suspicious_duplicate_changed_bodies(match_data)
+
+        self.assertEqual(1, len(issues))
+        self.assertIn("modified_254", issues[0])
+        self.assertIn("added_272", issues[0])
+
+    def test_duplicate_target_bodies_are_allowed_when_sources_match(self):
+        shared_source_body = (
+            "Use the same long instructions for both views. " * 20
+        )
+        shared_target_body = (
+            "两个视图都使用同一组较长的说明。" * 30
+        )
+        match_data = {
+            "modified_10": {
+                "source_operation": "modified",
+                "source_new_content": f"## First\n\n{shared_source_body}",
+                "target_new_content": f"## 第一\n\n{shared_target_body}",
+            },
+            "added_20": {
+                "source_operation": "added",
+                "source_new_content": f"## Second\n\n{shared_source_body}",
+                "target_new_content": f"## 第二\n\n{shared_target_body}",
+            },
+        }
+
+        self.assertEqual(
+            [],
+            _find_suspicious_duplicate_changed_bodies(match_data),
+        )
+
+    def test_short_duplicate_target_bodies_do_not_block_updates(self):
+        match_data = {
+            "modified_10": {
+                "source_operation": "modified",
+                "source_new_content": "## First\n\nFirst source body.",
+                "target_new_content": "## 第一\n\n相同提示。",
+            },
+            "added_20": {
+                "source_operation": "added",
+                "source_new_content": "## Second\n\nDifferent source body.",
+                "target_new_content": "## 第二\n\n相同提示。",
+            },
+        }
+
+        self.assertEqual(
+            [],
+            _find_suspicious_duplicate_changed_bodies(match_data),
+        )
+
+    def test_suspicious_duplicate_bodies_preserve_existing_target_file(self):
+        duplicated_target_body = "这是一段不应同时出现在两个不同章节中的较长译文。\n" * 30
+        match_data = {
+            "modified_10": {
+                "source_operation": "modified",
+                "source_new_content": (
+                    "## Configure logging\n\n"
+                    "Configure rotation, redaction, and storage settings."
+                ),
+                "target_line": "3",
+                "target_hierarchy": "## 配置日志记录",
+                "target_new_content": (
+                    "## 配置日志记录\n\n"
+                    f"{duplicated_target_body}"
+                ),
+            },
+            "added_20": {
+                "source_operation": "added",
+                "source_new_content": (
+                    "## Filter audit events\n\n"
+                    "Choose SQL users and the events that should be audited."
+                ),
+                "target_line": "-1",
+                "target_hierarchy": "bottom-added-20",
+                "target_new_content": (
+                    "## 过滤审计事件\n\n"
+                    f"{duplicated_target_body}"
+                ),
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_file = tmp_path / "audit.md"
+            match_file = tmp_path / "audit-match_source_diff_to_target.json"
+            original_content = "# Audit\n\n## 配置日志记录\n\n原有内容。\n"
+            target_file.write_text(original_content, encoding="utf-8")
+            match_file.write_text(json.dumps(match_data), encoding="utf-8")
+
+            with mock.patch("file_updater.thread_safe_print"):
+                success = update_target_document_from_match_data(
+                    str(match_file),
+                    str(tmp_path),
+                    "audit.md",
+                )
+
+            self.assertFalse(success)
+            self.assertEqual(original_content, target_file.read_text(encoding="utf-8"))
+
     def test_incomplete_response_with_missing_key_remains_useful_partial_result(self):
         class FakeAIClient:
             def chat_completion(self, messages, temperature=0.1):

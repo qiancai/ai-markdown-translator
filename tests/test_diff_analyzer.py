@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 import json
+import difflib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -11,6 +12,7 @@ from unittest import mock
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import diff_analyzer
 from diff_analyzer import (
     analyze_diff_operations,
     analyze_source_changes,
@@ -25,6 +27,7 @@ from diff_analyzer import (
     detect_restructured_file,
     filter_changed_files_to_pr_scope,
     filter_related_resources_resource_card_diff,
+    find_sections_by_operation_type,
     get_pr_diff,
     get_target_file_content,
     get_target_hierarchy_and_content,
@@ -2035,6 +2038,236 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             "### Prerequisites",
             next(line for line in operations["modified_lines"] if line["is_header"])["original_content"],
         )
+
+    def test_inserted_section_before_renamed_existing_section_keeps_continuity(self):
+        base_content = (
+            "# Audit\n\n"
+            "## Specify auditing filter rules\n\n"
+            "After enabling audit logging, specify filter rules.\n\n"
+            "1. Add a filter rule.\n\n"
+            "2. Expand the rule list.\n\n"
+            "> Keep the filter scope narrow to reduce resource usage.\n\n"
+            "## View audit logs\n\n"
+            "View the logs in cloud storage.\n"
+        )
+        head_content = (
+            "# Audit\n\n"
+            "## Configure database audit logging settings\n\n"
+            "Configure log rotation by size or time.\n\n"
+            "Enable log redaction and click **Save and Enable**.\n\n"
+            "## Specify audit filter rules\n\n"
+            "After enabling audit logging, specify filter rules.\n\n"
+            "1. Add a filter rule.\n\n"
+            "2. Select the SQL user and filter events.\n\n"
+            "> Keep the filter scope narrow to reduce resource usage.\n\n"
+            "## View audit logs\n\n"
+            "View the logs in cloud storage.\n"
+        )
+        patch = "\n".join(
+            difflib.unified_diff(
+                base_content.splitlines(),
+                head_content.splitlines(),
+                fromfile="base",
+                tofile="head",
+                n=3,
+                lineterm="",
+            )
+        )
+        changed_file = SimpleNamespace(
+            filename="audit.md",
+            status="modified",
+            patch=patch,
+        )
+
+        with mock.patch.object(diff_analyzer, "thread_safe_print") as safe_print:
+            operations = analyze_diff_operations(
+                changed_file,
+                base_content=base_content,
+                head_content=head_content,
+            )
+
+        self.assertTrue(
+            any(
+                "Preferred section-continuity heading match" in str(call.args)
+                for call in safe_print.call_args_list
+            )
+        )
+
+        modified_headers = [
+            line for line in operations["modified_lines"] if line["is_header"]
+        ]
+        added_headers = [
+            line for line in operations["added_lines"] if line["is_header"]
+        ]
+        self.assertEqual(1, len(modified_headers))
+        self.assertEqual(
+            "## Specify auditing filter rules",
+            modified_headers[0]["original_content"],
+        )
+        self.assertEqual(
+            "## Specify audit filter rules",
+            modified_headers[0]["content"],
+        )
+        self.assertEqual(
+            ["## Configure database audit logging settings"],
+            [line["content"] for line in added_headers],
+        )
+
+        head_hierarchy = build_hierarchy_dict(head_content)
+        base_hierarchy = build_hierarchy_dict(base_content)
+        sections = find_sections_by_operation_type(
+            head_content.splitlines(),
+            operations,
+            head_hierarchy,
+            base_hierarchy,
+        )
+        modified_header_lines = {
+            line["line_number"]
+            for line in modified_headers
+        }
+        sections["added"] -= modified_header_lines
+        source_diff = build_source_diff_dict(
+            modified_sections={
+                str(line_number): head_hierarchy[line_number]
+                for line_number in sections["modified"]
+                if line_number in head_hierarchy
+            },
+            added_sections={
+                str(line_number): head_hierarchy[line_number]
+                for line_number in sections["added"]
+                if line_number in head_hierarchy
+            },
+            deleted_sections={},
+            all_hierarchy_dict=head_hierarchy,
+            base_hierarchy_dict=base_hierarchy,
+            operations=operations,
+            file_content=head_content,
+            base_file_content=base_content,
+        )
+
+        self.assertCountEqual(
+            ["added", "modified"],
+            [
+                entry["operation"]
+                for entry in source_diff.values()
+                if entry["new_line_number"] < 20
+            ],
+        )
+        added_entry = next(
+            entry for entry in source_diff.values()
+            if entry["operation"] == "added"
+        )
+        modified_entry = next(
+            entry for entry in source_diff.values()
+            if entry["operation"] == "modified"
+        )
+        self.assertIn(
+            "Configure database audit logging settings",
+            added_entry["new_content"],
+        )
+        self.assertEqual(
+            "## Specify auditing filter rules",
+            added_entry["original_hierarchy"],
+        )
+        self.assertIn("Specify audit filter rules", modified_entry["new_content"])
+
+    def test_adjacent_true_rename_wins_over_later_title_only_match(self):
+        base_content = (
+            "# Guide\n\n"
+            "## Configure AWS\n\n"
+            "Keep this existing workflow line.\n\n"
+            "Keep this second workflow line.\n\n"
+            "## Next\n\n"
+            "Next body.\n"
+        )
+        head_content = (
+            "# Guide\n\n"
+            "## Set up the provider\n\n"
+            "Keep this existing workflow line.\n\n"
+            "Keep this second workflow line.\n\n"
+            "## Configure AWS permissions\n\n"
+            "Keep this existing workflow line.\n\n"
+            "Keep this second workflow line.\n\n"
+            "Attach the policy to a new role.\n\n"
+            "## Next\n\n"
+            "Next body.\n"
+        )
+        patch = "\n".join(
+            difflib.unified_diff(
+                base_content.splitlines(),
+                head_content.splitlines(),
+                fromfile="base",
+                tofile="head",
+                n=3,
+                lineterm="",
+            )
+        )
+        changed_file = SimpleNamespace(
+            filename="guide.md",
+            status="modified",
+            patch=patch,
+        )
+
+        operations = analyze_diff_operations(
+            changed_file,
+            base_content=base_content,
+            head_content=head_content,
+        )
+
+        modified_headers = [
+            line for line in operations["modified_lines"] if line["is_header"]
+        ]
+        self.assertEqual(1, len(modified_headers))
+        self.assertEqual("## Configure AWS", modified_headers[0]["original_content"])
+        self.assertEqual("## Set up the provider", modified_headers[0]["content"])
+        self.assertIn(
+            "## Configure AWS permissions",
+            [
+                line["content"]
+                for line in operations["added_lines"]
+                if line["is_header"]
+            ],
+        )
+
+    def test_section_continuity_reuses_cached_body_extraction(self):
+        shared_body = (
+            "Preserve this first workflow instruction exactly.\n\n"
+            "Preserve this second workflow instruction exactly.\n"
+        )
+        base_content = f"# Guide\n\n## Configure service\n\n{shared_body}"
+        head_content = (
+            f"# Guide\n\n## Configure service alpha\n\n{shared_body}\n"
+            f"## Configure service beta\n\n{shared_body}\n"
+            f"## Configure service gamma\n\n{shared_body}"
+        )
+        patch = "\n".join(
+            difflib.unified_diff(
+                base_content.splitlines(),
+                head_content.splitlines(),
+                fromfile="base",
+                tofile="head",
+                n=20,
+                lineterm="",
+            )
+        )
+        changed_file = SimpleNamespace(
+            filename="guide.md",
+            status="modified",
+            patch=patch,
+        )
+
+        with mock.patch.object(
+            diff_analyzer,
+            "extract_section_direct_content",
+            wraps=diff_analyzer.extract_section_direct_content,
+        ) as extract_section:
+            analyze_diff_operations(
+                changed_file,
+                base_content=base_content,
+                head_content=head_content,
+            )
+
+        self.assertEqual(4, extract_section.call_count)
 
     def test_adjacent_delete_add_heading_blocks_are_not_paired_as_renames(self):
         patch = "\n".join(

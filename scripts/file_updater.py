@@ -3757,6 +3757,90 @@ def apply_heading_level_change_to_target(target_content, old_level, new_level):
     return '\n'.join(lines)
 
 
+SUSPICIOUS_DUPLICATE_BODY_MIN_CHARS = 300
+SUSPICIOUS_DUPLICATE_BODY_MIN_LINES = 3
+SUSPICIOUS_DUPLICATE_SOURCE_SIMILARITY = 0.50
+
+
+def _normalized_section_body(content):
+    """Normalize a translated/source section body without its first heading."""
+    if not isinstance(content, str) or not content.strip():
+        return "", 0
+
+    body_lines = []
+    removed_heading = False
+    for raw_line in content.splitlines():
+        if not removed_heading and is_markdown_heading(raw_line):
+            removed_heading = True
+            continue
+        line = re.sub(r"\s+", " ", raw_line.strip())
+        if line:
+            body_lines.append(line)
+
+    return "\n".join(body_lines), len(body_lines)
+
+
+def _find_suspicious_duplicate_changed_bodies(match_data):
+    """Find high-confidence duplicated translations before writing a file.
+
+    Limit this guard to an added/modified pair with long, exactly duplicated
+    target bodies whose source bodies are materially different. Short shared
+    notes and intentionally repeated source instructions remain allowed.
+    """
+    candidates = []
+    for key, section_data in (match_data or {}).items():
+        operation = section_data.get("source_operation", "")
+        if operation not in ("added", "modified"):
+            continue
+
+        source_body, _ = _normalized_section_body(
+            section_data.get("source_new_content", "")
+        )
+        target_body, target_line_count = _normalized_section_body(
+            section_data.get("target_new_content", "")
+        )
+        if not source_body or not target_body:
+            continue
+        if (
+            len(target_body) < SUSPICIOUS_DUPLICATE_BODY_MIN_CHARS
+            or target_line_count < SUSPICIOUS_DUPLICATE_BODY_MIN_LINES
+        ):
+            continue
+
+        candidates.append(
+            {
+                "key": key,
+                "operation": operation,
+                "source_body": source_body,
+                "target_body": target_body,
+            }
+        )
+
+    issues = []
+    for index, left in enumerate(candidates):
+        for right in candidates[index + 1:]:
+            if {left["operation"], right["operation"]} != {"added", "modified"}:
+                continue
+            if left["target_body"] != right["target_body"]:
+                continue
+
+            source_similarity = difflib.SequenceMatcher(
+                None,
+                left["source_body"],
+                right["source_body"],
+            ).ratio()
+            if source_similarity >= SUSPICIOUS_DUPLICATE_SOURCE_SIMILARITY:
+                continue
+
+            issues.append(
+                f"{left['key']} and {right['key']} have identical long target "
+                "bodies but materially different source sections "
+                f"(source similarity {source_similarity:.0%})"
+            )
+
+    return issues
+
+
 def update_target_document_from_match_data(match_file_path, target_local_path, target_file_name=None):
     """
     Update target document using data from match_source_diff_to_target.json
@@ -3784,6 +3868,16 @@ def update_target_document_from_match_data(match_file_path, target_local_path, t
     
     if not match_data:
         thread_safe_print("❌ No matching data found")
+        return False
+
+    duplicate_body_issues = _find_suspicious_duplicate_changed_bodies(match_data)
+    if duplicate_body_issues:
+        thread_safe_print(
+            "❌ Suspicious duplicate translated section bodies detected; "
+            "preserving the existing target file"
+        )
+        for issue in duplicate_body_issues:
+            thread_safe_print(f"   - {issue}")
         return False
     
     # Sort sections by target_line from large to small (modify from back to front)
