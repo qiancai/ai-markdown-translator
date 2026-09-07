@@ -165,6 +165,62 @@ def collect_toc_scope_added_files(docs_source_path, toc_files, base_ref, head_re
     return head_links - base_links
 
 
+def collect_new_toc_full_translation_files(
+    docs_source_path,
+    docs_target_path,
+    toc_files,
+    base_ref,
+    head_ref,
+    extra_files=None,
+):
+    """Return files that need a one-time full translation for a new TOC scope.
+
+    A configured TOC is new when it exists at the source HEAD but not in the
+    checked-out target branch. Links from all new TOCs are deduplicated before
+    subtracting the aggregate scope of TOCs that already exist in the target.
+    """
+    if not docs_target_path:
+        return set(), set()
+
+    target_root = Path(docs_target_path)
+    new_toc_files = {
+        toc_file
+        for toc_file in toc_files
+        if read_git_file(docs_source_path, head_ref, toc_file) is not None
+        and not (target_root / toc_file).is_file()
+    }
+    existing_toc_files = set(toc_files) - new_toc_files
+
+    new_toc_links = set()
+    for toc_file in new_toc_files:
+        head_content = read_git_file(docs_source_path, head_ref, toc_file)
+        new_toc_links.update(extract_markdown_doc_links(head_content or ""))
+
+    previously_allowed_links = set()
+    for toc_file in existing_toc_files:
+        # BASE is intentional: a link added to an existing TOC during this
+        # compare range was not previously covered by weekly translation. If
+        # a new TOC also links it, it still needs one complete HEAD translation.
+        base_content = read_git_file(docs_source_path, base_ref, toc_file)
+        previously_allowed_links.update(extract_markdown_doc_links(base_content or ""))
+
+    full_translation_files = set(new_toc_files)
+    full_translation_files.update(new_toc_links - previously_allowed_links)
+
+    # Configured index files are not necessarily linked from a TOC. A missing
+    # target index therefore needs the same one-time HEAD translation.
+    for extra_file in extra_files or []:
+        rel = normalize_doc_path(extra_file)
+        if (
+            rel
+            and read_git_file(docs_source_path, head_ref, rel) is not None
+            and not (target_root / rel).is_file()
+        ):
+            full_translation_files.add(rel)
+
+    return full_translation_files, new_toc_files
+
+
 def add_unique(items, item):
     if item and item not in items:
         items.append(item)
@@ -174,14 +230,14 @@ def resolve_source_files(
     allowed,
     input_file_names="",
     changed_rows=None,
-    toc_scope_added_files=None,
+    always_include_files=None,
 ):
-    normalized_scope_added_files = set()
-    for item in toc_scope_added_files or []:
+    normalized_always_include_files = set()
+    for item in always_include_files or []:
         rel = normalize_doc_path(item)
         if rel:
-            normalized_scope_added_files.add(rel)
-    toc_scope_added_files = normalized_scope_added_files
+            normalized_always_include_files.add(rel)
+    always_include_files = normalized_always_include_files
     requested = [
         resolve_requested_file(item, allowed)
         for item in parse_list(input_file_names)
@@ -192,7 +248,7 @@ def resolve_source_files(
     if requested:
         invalid = [
             item for item in requested
-            if item not in allowed and item not in toc_scope_added_files
+            if item not in allowed and item not in always_include_files
         ]
         if invalid:
             raise ValueError(
@@ -206,12 +262,12 @@ def resolve_source_files(
     for row in changed_rows or []:
         filename = row.get("filename", "")
         previous_filename = row.get("previous_filename", "")
-        if filename in allowed or filename in toc_scope_added_files:
+        if filename in allowed or filename in always_include_files:
             add_unique(resolved, filename)
-        if previous_filename in allowed or previous_filename in toc_scope_added_files:
+        if previous_filename in allowed or previous_filename in always_include_files:
             add_unique(resolved, previous_filename)
 
-    for rel in sorted(toc_scope_added_files):
+    for rel in sorted(always_include_files):
         add_unique(resolved, rel)
 
     return resolved
@@ -227,6 +283,7 @@ def append_github_output(output_path, values):
 
 def main():
     docs_source_path = os.environ["DOCS_SOURCE_PATH"]
+    docs_target_path = os.getenv("DOCS_TARGET_PATH", "")
     toc_files = parse_list(os.getenv("TOC_FILES") or os.environ.get("CLOUD_TOC_FILES", ""))
     cloud_index_files = parse_list(os.getenv("INDEX_FILES") or os.getenv("CLOUD_INDEX_FILES", ""))
     input_file_names = os.getenv("INPUT_FILE_NAMES", "")
@@ -237,6 +294,8 @@ def main():
     if input_file_names.strip():
         changed_rows = []
         toc_scope_added_files = set()
+        full_translation_files = set()
+        new_toc_files = set()
     else:
         changed_rows = list_changed_files(docs_source_path, base_ref, head_ref)
         toc_scope_added_files = collect_toc_scope_added_files(
@@ -245,17 +304,34 @@ def main():
             base_ref,
             head_ref,
         )
+        new_toc_full_translation_files, new_toc_files = (
+            collect_new_toc_full_translation_files(
+                docs_source_path,
+                docs_target_path,
+                toc_files,
+                base_ref,
+                head_ref,
+                extra_files=cloud_index_files,
+            )
+        )
+        # A file newly linked from an existing TOC also enters translation
+        # scope for the first time and must use its complete HEAD content.
+        full_translation_files = (
+            set(toc_scope_added_files) | new_toc_full_translation_files
+        )
     resolved = resolve_source_files(
         allowed,
         input_file_names=input_file_names,
         changed_rows=changed_rows,
-        toc_scope_added_files=toc_scope_added_files,
+        always_include_files=full_translation_files,
     )
 
     append_github_output(
         os.getenv("GITHUB_OUTPUT", ""),
         {
             "files": ",".join(resolved),
+            "full_files": ",".join(sorted(full_translation_files)),
+            "new_toc_files": ",".join(sorted(new_toc_files)),
             "has_source_changes": "true" if resolved else "false",
             "allowed_count": str(len(allowed)),
         },
@@ -263,6 +339,13 @@ def main():
 
     if resolved:
         print(f"Resolved {len(resolved)} source file(s): {','.join(resolved)}")
+        if new_toc_files:
+            print(f"Detected new target TOC file(s): {','.join(sorted(new_toc_files))}")
+        if full_translation_files:
+            print(
+                "Resolved "
+                f"{len(full_translation_files)} full-translation bootstrap file(s)."
+            )
     else:
         print("No Cloud TOC-scoped source changes detected.")
 

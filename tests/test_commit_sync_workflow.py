@@ -18,6 +18,26 @@ from translation_structure_validator import StructureValidationIssue
 
 
 class CommitSyncWorkflowHelpersTest(unittest.TestCase):
+    def test_full_translation_paths_are_excluded_from_marker_groups(self):
+        marker_groups = {
+            "base-a": {"bootstrap.md", "incremental-a.md"},
+            "base-b": {"bootstrap.md"},
+            "base-c": {"incremental-c.md"},
+        }
+
+        filtered = workflow.exclude_paths_from_marker_groups(
+            marker_groups,
+            {"bootstrap.md"},
+        )
+
+        self.assertEqual(
+            filtered,
+            {
+                "base-a": {"incremental-a.md"},
+                "base-c": {"incremental-c.md"},
+            },
+        )
+
     def test_restructured_reconciliation_failure_never_falls_back_to_overwrite(self):
         stats = workflow.TranslationStats()
         added_files = {"guide.md": "# New source\n"}
@@ -2137,6 +2157,60 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             {"tidb-cloud/dedicated/_index.md"},
         )
         self.assertEqual(result["counts"], zero_counts)
+
+    def test_process_translation_group_bootstraps_full_files_without_incremental_diff(self):
+        stats = workflow.TranslationStats()
+
+        with mock.patch.object(
+            workflow,
+            "apply_source_files_full_translation_mode",
+            return_value={"TOC-new.md", "new-guide.md"},
+        ) as apply_full, mock.patch.object(
+            workflow,
+            "apply_toc_scope_added_files",
+            side_effect=AssertionError("Explicit source scope should skip secondary expansion"),
+        ), mock.patch.object(
+            workflow,
+            "should_parallelize_file_processing",
+            return_value=False,
+        ), mock.patch.object(
+            workflow,
+            "validate_successful_translation_structures",
+        ):
+            result = workflow.process_translation_group(
+                "new TOC bootstrap",
+                source_files_translation_mode="incremental",
+                source_files="TOC-new.md,new-guide.md",
+                source_folder="",
+                diff_context={
+                    "mode": "commit",
+                    "source_repo": "pingcap/docs",
+                    "target_repo": "pingcap/docs",
+                    "base_ref": "base",
+                    "head_ref": "head",
+                },
+                filtered_changed_files=[],
+                pr_diff="",
+                github_client=object(),
+                ai_client=object(),
+                repo_config={
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                    "target_local_path": "/tmp/unused",
+                },
+                repo_configs={},
+                glossary_matcher=None,
+                commit_ignore_files=[],
+                translation_stats=stats,
+                source_full_files="TOC-new.md,new-guide.md",
+            )
+
+        self.assertTrue(result["attempted"])
+        apply_full.assert_called_once()
+        self.assertEqual(
+            apply_full.call_args.args[0],
+            "TOC-new.md,new-guide.md",
+        )
 
     def test_process_translation_group_applies_formatting_only_without_ai(self):
         file_path = "tidb-cloud/monitor-alert-slack.md"

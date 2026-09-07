@@ -10,6 +10,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from resolve_cloud_source_files import (
     build_allowed_files,
+    collect_new_toc_full_translation_files,
     collect_toc_scope_added_files,
     extract_markdown_doc_links,
     parse_git_name_status,
@@ -18,6 +19,132 @@ from resolve_cloud_source_files import (
 
 
 class ResolveCloudSourceFilesTest(unittest.TestCase):
+    def test_new_tocs_deduplicate_links_and_only_bootstrap_new_scope(self):
+        with tempfile.TemporaryDirectory() as source_tmpdir, tempfile.TemporaryDirectory() as target_tmpdir:
+            source_root = Path(source_tmpdir)
+            target_root = Path(target_tmpdir)
+            subprocess.run(
+                ["git", "init"],
+                cwd=source_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source_root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=source_root, check=True)
+
+            files = {
+                "TOC-existing.md": "- [Shared](/shared.md)\n",
+                "TOC-new-a.md": "- [Shared](/shared.md)\n- [A](/new-a.md)\n- [Common](/new-common.md)\n- [Head overlap](/head-overlap.md)\n",
+                "TOC-new-b.md": "- [B](/new-b.md)\n- [Common](/new-common.md)\n",
+                "shared.md": "# Shared\n",
+                "new-a.md": "# A\n",
+                "new-b.md": "# B\n",
+                "new-common.md": "# Common\n",
+                "head-overlap.md": "# Head overlap\n",
+                "new/_index.md": "---\ntitle: New\n---\n",
+            }
+            for file_path, content in files.items():
+                path = source_root / file_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=source_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "source"],
+                cwd=source_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            base_ref = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=source_root, text=True
+            ).strip()
+            (source_root / "TOC-existing.md").write_text(
+                "- [Shared](/shared.md)\n- [Head overlap](/head-overlap.md)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "commit", "-am", "existing TOC adds a link"],
+                cwd=source_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            head_ref = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=source_root, text=True
+            ).strip()
+
+            (target_root / "TOC-existing.md").write_text(
+                "- [共享](/shared.md)\n", encoding="utf-8"
+            )
+
+            full_files, new_tocs = collect_new_toc_full_translation_files(
+                source_root,
+                target_root,
+                ["TOC-existing.md", "TOC-new-a.md", "TOC-new-b.md"],
+                base_ref,
+                head_ref,
+                extra_files=["new/_index.md"],
+            )
+
+        self.assertEqual(new_tocs, {"TOC-new-a.md", "TOC-new-b.md"})
+        self.assertEqual(
+            full_files,
+            {
+                "TOC-new-a.md",
+                "TOC-new-b.md",
+                "new-a.md",
+                "new-b.md",
+                "new-common.md",
+                "head-overlap.md",
+                "new/_index.md",
+            },
+        )
+        self.assertNotIn("shared.md", full_files)
+
+    def test_existing_target_toc_does_not_trigger_bootstrap(self):
+        with tempfile.TemporaryDirectory() as source_tmpdir, tempfile.TemporaryDirectory() as target_tmpdir:
+            source_root = Path(source_tmpdir)
+            target_root = Path(target_tmpdir)
+            subprocess.run(
+                ["git", "init"],
+                cwd=source_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source_root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=source_root, check=True)
+            (source_root / "TOC-cloud.md").write_text(
+                "- [Guide](/guide.md)\n", encoding="utf-8"
+            )
+            (source_root / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=source_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "source"],
+                cwd=source_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            source_ref = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=source_root, text=True
+            ).strip()
+            (target_root / "TOC-cloud.md").write_text(
+                "- [指南](/guide.md)\n", encoding="utf-8"
+            )
+
+            full_files, new_tocs = collect_new_toc_full_translation_files(
+                source_root,
+                target_root,
+                ["TOC-cloud.md"],
+                source_ref,
+                source_ref,
+            )
+
+        self.assertEqual(new_tocs, set())
+        self.assertEqual(full_files, set())
+
     def test_build_allowed_files_keeps_links_with_anchors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -117,7 +244,7 @@ class ResolveCloudSourceFilesTest(unittest.TestCase):
         resolved = resolve_source_files(
             allowed,
             changed_rows=changed_rows,
-            toc_scope_added_files={"shared/newly-linked.md"},
+            always_include_files={"shared/newly-linked.md"},
         )
 
         self.assertEqual(resolved, ["TOC-tidb-cloud.md", "shared/newly-linked.md"])
