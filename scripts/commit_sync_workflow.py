@@ -20,6 +20,7 @@ SOURCE_BASE_REF = os.getenv("SOURCE_BASE_REF", "")
 SOURCE_HEAD_REF = os.getenv("SOURCE_HEAD_REF", "")
 SOURCE_FOLDER = os.getenv("SOURCE_FOLDER", "")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
+SOURCE_FULL_FILES = os.getenv("SOURCE_FULL_FILES", "")
 SOURCE_FILES_TRANSLATION_MODE = os.getenv("SOURCE_FILES_TRANSLATION_MODE", "incremental")
 SOURCE_LANGUAGE_OVERRIDE = os.getenv("SOURCE_LANGUAGE", "")
 TARGET_LANGUAGE_OVERRIDE = os.getenv("TARGET_LANGUAGE", "")
@@ -360,6 +361,19 @@ def normalize_commit_sync_run_type(run_type):
     if normalized in RUN_TYPE_SCHEDULED_ALIASES:
         return "scheduled"
     return ""
+
+
+def exclude_paths_from_marker_groups(marker_groups, excluded_paths):
+    """Keep full-translation files out of per-file incremental cursor groups."""
+    excluded_paths = set(excluded_paths or [])
+    if not excluded_paths:
+        return marker_groups
+
+    return {
+        source_ref: remaining_paths
+        for source_ref, file_paths in marker_groups.items()
+        if (remaining_paths := set(file_paths) - excluded_paths)
+    }
 
 
 def commits_match(left, right):
@@ -1535,6 +1549,7 @@ def process_translation_group(
     glossary_matcher,
     commit_ignore_files,
     translation_stats,
+    source_full_files="",
 ):
     """Process one commit-sync translation group that shares the same base ref.
 
@@ -1576,66 +1591,63 @@ def process_translation_group(
         deleted_images = []
         restructured_files = set()
     else:
-        if not filtered_changed_files:
-            thread_safe_print("ℹ️  No matching source changes found for this translation group.")
-            return finalize({
-                "attempted": False,
-                "successful_file_paths": successful_file_paths,
-                "counts": {
-                    "added_files": 0,
-                    "deleted_files": 0,
-                    "toc_files": 0,
-                    "keyword_files": 0,
-                    "index_files": 0,
-                    "formatting_files": 0,
-                    "modified_sections": 0,
-                    "added_images": 0,
-                    "modified_images": 0,
-                    "deleted_images": 0,
-                },
-            })
+        if filtered_changed_files:
+            thread_safe_print(f"📊 Filtered changed files: {len(filtered_changed_files)}")
+            if pr_diff:
+                thread_safe_print(f"✅ Built diff text: {len(pr_diff)} characters")
+            else:
+                thread_safe_print("ℹ️  No markdown patch text found; continuing in case there are file-level or image changes.")
 
-        thread_safe_print(f"📊 Filtered changed files: {len(filtered_changed_files)}")
-        if pr_diff:
-            thread_safe_print(f"✅ Built diff text: {len(pr_diff)} characters")
+            exclude_folders = build_exclude_folders(repo_config)
+
+            try:
+                added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files, formatting_files = analyze_source_changes(
+                    diff_context,
+                    github_client,
+                    special_files=SPECIAL_FILES,
+                    ignore_files=commit_ignore_files,
+                    repo_configs=repo_configs,
+                    max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
+                    pr_diff=pr_diff,
+                    exclude_folders=exclude_folders,
+                    include_formatting_files=True,
+                )
+            except Exception as e:
+                translation_stats.mark_failure(
+                    group_label,
+                    f"Source diff analysis failed: {sanitize_exception_message(e)}",
+                )
+                return finalize({
+                    "attempted": True,
+                    "successful_file_paths": successful_file_paths,
+                    "counts": {
+                        "added_files": 0,
+                        "deleted_files": 0,
+                        "toc_files": 0,
+                        "keyword_files": 0,
+                        "index_files": 0,
+                        "formatting_files": 0,
+                        "modified_sections": 0,
+                        "added_images": 0,
+                        "modified_images": 0,
+                        "deleted_images": 0,
+                    },
+                })
         else:
-            thread_safe_print("ℹ️  No markdown patch text found; continuing in case there are file-level or image changes.")
-
-        exclude_folders = build_exclude_folders(repo_config)
-
-        try:
-            added_sections, modified_sections, deleted_sections, added_files, deleted_files, toc_files, keyword_files, added_images, modified_images, deleted_images, restructured_files, index_files, formatting_files = analyze_source_changes(
-                diff_context,
-                github_client,
-                special_files=SPECIAL_FILES,
-                ignore_files=commit_ignore_files,
-                repo_configs=repo_configs,
-                max_non_system_sections=MAX_NON_SYSTEM_SECTIONS_FOR_AI,
-                pr_diff=pr_diff,
-                exclude_folders=exclude_folders,
-                include_formatting_files=True,
-            )
-        except Exception as e:
-            translation_stats.mark_failure(
-                group_label,
-                f"Source diff analysis failed: {sanitize_exception_message(e)}",
-            )
-            return finalize({
-                "attempted": True,
-                "successful_file_paths": successful_file_paths,
-                "counts": {
-                    "added_files": 0,
-                    "deleted_files": 0,
-                    "toc_files": 0,
-                    "keyword_files": 0,
-                    "index_files": 0,
-                    "formatting_files": 0,
-                    "modified_sections": 0,
-                    "added_images": 0,
-                    "modified_images": 0,
-                    "deleted_images": 0,
-                },
-            })
+            thread_safe_print("ℹ️  No matching incremental source changes found for this translation group.")
+            added_sections = {}
+            modified_sections = {}
+            deleted_sections = {}
+            added_files = {}
+            deleted_files = []
+            toc_files = {}
+            keyword_files = {}
+            index_files = {}
+            formatting_files = {}
+            added_images = []
+            modified_images = []
+            deleted_images = []
+            restructured_files = set()
 
     full_translation_file_paths = set()
     if source_files_translation_mode == "full":
@@ -1657,6 +1669,29 @@ def process_translation_group(
             formatting_files=formatting_files,
         )
     else:
+        if source_full_files.strip():
+            thread_safe_print(
+                "\n📄 Translating newly entered TOC scope files from complete HEAD content."
+            )
+            full_translation_file_paths.update(
+                apply_source_files_full_translation_mode(
+                    source_full_files,
+                    source_folder,
+                    filtered_changed_files,
+                    diff_context,
+                    github_client,
+                    commit_ignore_files,
+                    added_sections,
+                    modified_sections,
+                    deleted_sections,
+                    added_files,
+                    toc_files,
+                    keyword_files,
+                    translation_stats,
+                    index_files=index_files,
+                    formatting_files=formatting_files,
+                )
+            )
         explicit_source_files = normalize_source_files(source_files, source_folder)
         if explicit_source_files:
             thread_safe_print(
@@ -2011,6 +2046,7 @@ def main():
         thread_safe_print(f"🧭 Compare Range: {SOURCE_BASE_REF}...{SOURCE_HEAD_REF}")
     thread_safe_print(f"📁 Source Folder Filter: {SOURCE_FOLDER or '(none)'}")
     thread_safe_print(f"📄 Source File Filter: {SOURCE_FILES or '(none)'}")
+    thread_safe_print(f"📄 Full Source File Bootstrap: {SOURCE_FULL_FILES or '(none)'}")
     if configured_source_files_translation_mode != source_files_translation_mode:
         thread_safe_print(
             "📄 Source Files Translation Mode: "
@@ -2163,6 +2199,19 @@ def main():
                 base_ref,
             )
 
+        full_source_file_paths = normalize_source_files(
+            SOURCE_FULL_FILES,
+            SOURCE_FOLDER,
+        )
+        if full_source_file_paths:
+            # A complete HEAD bootstrap supersedes both target-file markers and
+            # persisted retry cursors. Keeping these paths in marker_groups
+            # would process the same file again through an incremental range.
+            marker_groups = exclude_paths_from_marker_groups(
+                marker_groups,
+                full_source_file_paths,
+            )
+
         if marker_groups:
             thread_safe_print("\n📌 Files with per-file Corresponding EN commit cursors:")
             for marker_ref, file_paths in sorted(marker_groups.items()):
@@ -2175,7 +2224,7 @@ def main():
                 f"detected ({len(marker_groups)} groups). This may increase compare API calls."
             )
 
-        if filtered_changed_files:
+        if filtered_changed_files or SOURCE_FULL_FILES.strip():
             diff_context["changed_files"] = filtered_changed_files
             pr_diff = build_diff_text(filtered_changed_files)
             group_result = process_translation_group(
@@ -2193,6 +2242,7 @@ def main():
                 glossary_matcher=glossary_matcher,
                 commit_ignore_files=commit_ignore_files,
                 translation_stats=translation_stats,
+                source_full_files=SOURCE_FULL_FILES,
             )
             all_successful_file_paths.update(group_result["successful_file_paths"])
             add_counts(total_counts, group_result["counts"])

@@ -18,6 +18,26 @@ from translation_structure_validator import StructureValidationIssue
 
 
 class CommitSyncWorkflowHelpersTest(unittest.TestCase):
+    def test_full_translation_paths_are_excluded_from_marker_groups(self):
+        marker_groups = {
+            "base-a": {"bootstrap.md", "incremental-a.md"},
+            "base-b": {"bootstrap.md"},
+            "base-c": {"incremental-c.md"},
+        }
+
+        filtered = workflow.exclude_paths_from_marker_groups(
+            marker_groups,
+            {"bootstrap.md"},
+        )
+
+        self.assertEqual(
+            filtered,
+            {
+                "base-a": {"incremental-a.md"},
+                "base-c": {"incremental-c.md"},
+            },
+        )
+
     def test_restructured_reconciliation_failure_never_falls_back_to_overwrite(self):
         stats = workflow.TranslationStats()
         added_files = {"guide.md": "# New source\n"}
@@ -1139,6 +1159,103 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
                 Path(tmpdir, "other.md").read_text(encoding="utf-8"),
             )
 
+    def test_scheduled_full_bootstrap_removes_existing_marker(self):
+        fake_github_client = object()
+        fake_ai_client = SimpleNamespace(model="fake-model")
+        zero_counts = {
+            "added_files": 0,
+            "deleted_files": 0,
+            "toc_files": 0,
+            "keyword_files": 0,
+            "modified_sections": 0,
+            "added_images": 0,
+            "modified_images": 0,
+            "deleted_images": 0,
+        }
+        global_context = {
+            "mode": "commit",
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "base_ref": "aaaaaaa111111111",
+            "head_ref": "ccccccc333333333",
+            "changed_files": [
+                SimpleNamespace(
+                    filename="guide.md",
+                    status="modified",
+                    patch="@@ -1 +1 @@\n-a\n+b\n",
+                ),
+            ],
+        }
+
+        def fake_process_translation_group(*args, **kwargs):
+            self.assertEqual(kwargs["source_full_files"], "guide.md")
+            return {
+                "attempted": True,
+                "successful_file_paths": {"guide.md"},
+                "counts": zero_counts,
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_file = Path(tmpdir, "guide.md")
+            target_file.write_text(
+                "# Guide <!--Corresponding EN commit: bbbbbbb222222222-->\n\nBody\n",
+                encoding="utf-8",
+            )
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO", "acme/docs"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO", "acme/docs-cn"))
+                stack.enter_context(mock.patch.object(workflow, "GITHUB_TOKEN", "token"))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REPO_PATH", tmpdir))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_BASE_REF", "aaaaaaa111111111"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_HEAD_REF", "ccccccc333333333"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES", "guide.md"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FULL_FILES", "guide.md"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FOLDER", ""))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_FILES_TRANSLATION_MODE", "incremental"))
+                stack.enter_context(mock.patch.object(workflow, "COMMIT_SYNC_RUN_TYPE", "schedule"))
+                stack.enter_context(mock.patch.object(workflow, "SOURCE_REPO_PATH", ""))
+                stack.enter_context(mock.patch.object(workflow, "TARGET_REF", ""))
+                stack.enter_context(mock.patch.object(workflow, "clean_temp_output_dir"))
+                stack.enter_context(mock.patch.object(workflow.Auth, "Token", return_value="token-auth"))
+                stack.enter_context(mock.patch.object(workflow, "Github", return_value=fake_github_client))
+                stack.enter_context(mock.patch.object(workflow, "UnifiedAIClient", return_value=fake_ai_client))
+                stack.enter_context(mock.patch.object(workflow, "load_glossary", return_value=[]))
+                stack.enter_context(mock.patch.object(workflow, "create_glossary_matcher", return_value=None))
+                stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "build_incremental_diff_context",
+                        return_value=global_context,
+                    )
+                )
+                process_group = stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "process_translation_group",
+                        side_effect=fake_process_translation_group,
+                    )
+                )
+                update_markers = stack.enter_context(
+                    mock.patch.object(
+                        workflow,
+                        "update_corresponding_en_commit_for_files",
+                        wraps=workflow.update_corresponding_en_commit_for_files,
+                    )
+                )
+                stack.enter_context(mock.patch.object(workflow, "git_add_changes"))
+                stack.enter_context(mock.patch.object(workflow, "update_retry_cursor_ledger", return_value=True))
+                stack.enter_context(mock.patch.object(workflow.TranslationStats, "write_failure_report"))
+
+                result = workflow.main()
+
+            self.assertEqual(result, 0)
+            process_group.assert_called_once()
+            self.assertEqual(update_markers.call_args.args[0], {"guide.md"})
+            self.assertNotIn(
+                "Corresponding EN commit",
+                target_file.read_text(encoding="utf-8"),
+            )
+
     def test_scheduled_run_removes_marker_when_per_file_cursor_matches_head(self):
         fake_github_client = object()
         fake_ai_client = SimpleNamespace(model="fake-model")
@@ -2137,6 +2254,60 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
             {"tidb-cloud/dedicated/_index.md"},
         )
         self.assertEqual(result["counts"], zero_counts)
+
+    def test_process_translation_group_bootstraps_full_files_without_incremental_diff(self):
+        stats = workflow.TranslationStats()
+
+        with mock.patch.object(
+            workflow,
+            "apply_source_files_full_translation_mode",
+            return_value={"TOC-new.md", "new-guide.md"},
+        ) as apply_full, mock.patch.object(
+            workflow,
+            "apply_toc_scope_added_files",
+            side_effect=AssertionError("Explicit source scope should skip secondary expansion"),
+        ), mock.patch.object(
+            workflow,
+            "should_parallelize_file_processing",
+            return_value=False,
+        ), mock.patch.object(
+            workflow,
+            "validate_successful_translation_structures",
+        ):
+            result = workflow.process_translation_group(
+                "new TOC bootstrap",
+                source_files_translation_mode="incremental",
+                source_files="TOC-new.md,new-guide.md",
+                source_folder="",
+                diff_context={
+                    "mode": "commit",
+                    "source_repo": "pingcap/docs",
+                    "target_repo": "pingcap/docs",
+                    "base_ref": "base",
+                    "head_ref": "head",
+                },
+                filtered_changed_files=[],
+                pr_diff="",
+                github_client=object(),
+                ai_client=object(),
+                repo_config={
+                    "source_language": "English",
+                    "target_language": "Chinese",
+                    "target_local_path": "/tmp/unused",
+                },
+                repo_configs={},
+                glossary_matcher=None,
+                commit_ignore_files=[],
+                translation_stats=stats,
+                source_full_files="TOC-new.md,new-guide.md",
+            )
+
+        self.assertTrue(result["attempted"])
+        apply_full.assert_called_once()
+        self.assertEqual(
+            apply_full.call_args.args[0],
+            "TOC-new.md,new-guide.md",
+        )
 
     def test_process_translation_group_applies_formatting_only_without_ai(self):
         file_path = "tidb-cloud/monitor-alert-slack.md"

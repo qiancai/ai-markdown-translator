@@ -196,6 +196,10 @@ export SOURCE_FILES="ai/foo.md,ai/bar.md"
 # selected file as a complete file using the source content at SOURCE_HEAD_REF.
 export SOURCE_FILES_TRANSLATION_MODE="incremental"
 
+# Optional: in an otherwise incremental run, translate this SOURCE_FILES
+# subset from complete SOURCE_HEAD_REF content.
+export SOURCE_FULL_FILES="TOC-new.md,new-scope/overview.md"
+
 # AI Provider and glossary
 export AI_PROVIDER="deepseek"  # deepseek, gemini, openai, or azure
 export TERMS_PATH="/path/to/terms.md"
@@ -205,6 +209,8 @@ export FAIL_ON_TRANSLATION_ERROR=true
 ```
 
 `commit_sync_workflow.py` uses the explicit `SOURCE_BASE_REF -> SOURCE_HEAD_REF` compare range passed in by the caller. For scheduled commit-based runs, target files that contain `<!--Corresponding EN commit: ...-->` and do not match `SOURCE_BASE_REF` are translated separately from that per-file commit to `SOURCE_HEAD_REF`. Manual runs add or update this marker on fully translated Markdown files; scheduled runs remove existing markers from fully translated Markdown files so those files return to the global cursor. Partial output is intentionally preserved and can be pushed, but its per-file cursor is not advanced. At the end of a scheduled run, the script atomically updates the global SHA and stores incomplete files with their original source refs in the `pending` object in `latest_translation_commit.json`, so later runs retry the missed range. If the process fails before atomic finalization, the caller workflow must refuse to advance the cursor or push that run.
+
+Cloud caller workflows can run `resolve_cloud_source_files.py` with both `DOCS_SOURCE_PATH` and `DOCS_TARGET_PATH`. If a configured `CLOUD_TOC_FILES` entry is missing from the target checkout, the resolver returns that TOC and the deduplicated documents that are not covered by any already-active TOC in `full_files`. Missing configured `CLOUD_INDEX_FILES` are included as well. Pass `full_files` to `SOURCE_FULL_FILES` so those files use complete HEAD content while shared or previously covered documents retain normal incremental sync.
 
 Both Python entry points modify the target checkout and stage successful changes by default. They do not create commits, push branches, post comments, or create pull requests; those operations belong to the caller workflow. Set `SKIP_GIT_ADD=true` when you want to inspect unstaged changes locally.
 
