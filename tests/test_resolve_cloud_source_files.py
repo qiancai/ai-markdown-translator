@@ -200,6 +200,13 @@ class ResolveCloudSourceFilesTest(unittest.TestCase):
             ],
         )
 
+    def test_extract_markdown_doc_links_ignores_unsupported_mdx_files(self):
+        links = extract_markdown_doc_links(
+            "- [Markdown](/guide.md)\n- [MDX](/unsupported.mdx)\n"
+        )
+
+        self.assertEqual(links, ["guide.md"])
+
     def test_manual_file_names_must_be_in_cloud_scope(self):
         allowed = {"TOC-tidb-cloud.md", "tidb-cloud/in-scope.md"}
 

@@ -40,7 +40,7 @@ def extract_markdown_doc_links_with_regex(markdown):
         if " " in url:
             url = url.split(None, 1)[0]
         rel = normalize_doc_path(url)
-        if rel.endswith(".md") or rel.endswith(".mdx"):
+        if rel.endswith(".md"):
             links.append(rel)
     return links
 
@@ -68,7 +68,7 @@ def extract_markdown_doc_links(markdown):
             if child.type != "link_open":
                 continue
             rel = normalize_doc_path(get_token_attr(child, "href"))
-            if rel.endswith(".md") or rel.endswith(".mdx"):
+            if rel.endswith(".md"):
                 links.append(rel)
     return links
 

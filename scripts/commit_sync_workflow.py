@@ -2211,7 +2211,6 @@ def main():
                 marker_groups,
                 full_source_file_paths,
             )
-            marker_file_paths -= full_source_file_paths
 
         if marker_groups:
             thread_safe_print("\n📌 Files with per-file Corresponding EN commit cursors:")
