@@ -15,8 +15,10 @@ from file_adder import (
     ensure_blank_lines_before_headings,
     preprocess_added_file_batch_for_heading_anchor_stability,
     process_added_files,
+    repair_suspected_untranslated_tables,
     strip_ai_markdown_wrapper,
     translate_file_batch,
+    translate_markdown_table,
 )
 from ai_client import CompletionText
 
@@ -63,6 +65,141 @@ class FileAdderRegressionTest(unittest.TestCase):
 
         self.assertIn("the following document content", ai_client.prompt)
         self.assertNotIn("the following  document content", ai_client.prompt)
+
+    def test_translation_prompt_requires_natural_language_in_tables(self):
+        class CapturingAIClient:
+            def __init__(self):
+                self.prompt = ""
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompt = messages[0]["content"]
+                return "| 概念 | 描述 |\n| --- | --- |\n| 角色 | 控制访问 |"
+
+        ai_client = CapturingAIClient()
+        translate_file_batch(
+            "| Concept | Description |\n| --- | --- |\n| Role | Controls access |",
+            ai_client,
+            source_language="English",
+            target_language="Chinese",
+        )
+
+        self.assertIn(
+            "translate natural-language text in every header cell and body cell",
+            ai_client.prompt,
+        )
+        self.assertIn("Preserve every pipe delimiter", ai_client.prompt)
+        self.assertIn(
+            'In columns headed "Parameter", "Field", "Setting", "Option"',
+            ai_client.prompt,
+        )
+        self.assertIn("exact UI action names, status labels", ai_client.prompt)
+
+    def test_retries_an_unchanged_table_and_replaces_only_that_table(self):
+        source = """# Guide
+
+Introductory text.
+
+| Concept | Description |
+| --- | --- |
+| Role | Controls access |
+
+Closing text."""
+        first_pass = """# 指南
+
+介绍文本。
+
+| Concept | Description |
+| --- | --- |
+| Role | Controls access |
+
+结束文本。"""
+        repaired_table = """| 概念 | 描述 |
+| --- | --- |
+| 角色 | 控制访问 |"""
+
+        class FakeAIClient:
+            def __init__(self):
+                self.responses = [first_pass, repaired_table]
+
+            def chat_completion(self, messages, temperature=0.1):
+                return self.responses.pop(0)
+
+        translated = translate_file_batch(
+            source,
+            FakeAIClient(),
+            source_language="English",
+            target_language="Chinese",
+        )
+
+        self.assertIn(repaired_table, translated)
+        self.assertIn("介绍文本。", translated)
+        self.assertIn("结束文本。", translated)
+        self.assertEqual([], translated.partial_reasons)
+
+    def test_table_repair_prompt_preserves_parameter_column_names(self):
+        class CapturingAIClient:
+            def __init__(self):
+                self.prompt = ""
+
+            def chat_completion(self, messages, temperature=0.1):
+                self.prompt = messages[0]["content"]
+                return "| 参数 | 说明 |\n| --- | --- |\n| Host name | 主机名 |"
+
+        ai_client = CapturingAIClient()
+        translate_markdown_table(
+            "| Parameter | Description |\n| --- | --- |\n| Host name | Host |",
+            "| 参数 | 说明 |\n| --- | --- |\n| 主机名 | 主机 |",
+            ai_client,
+        )
+
+        self.assertIn(
+            'When a column headed "Parameter", "Field", "Setting", "Option"',
+            ai_client.prompt,
+        )
+        self.assertIn("exact UI action names, status labels", ai_client.prompt)
+
+    def test_rejected_table_repair_preserves_first_pass_output(self):
+        source = """| Concept | Description |
+| --- | --- |
+| Role | Controls access |"""
+        invalid_repair = """| 概念 |
+| --- |
+| 角色 |"""
+
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return invalid_repair
+
+        repaired, reasons = repair_suspected_untranslated_tables(
+            source,
+            source,
+            FakeAIClient(),
+        )
+
+        self.assertEqual(source, repaired)
+        self.assertTrue(any("repair rejected" in reason for reason in reasons))
+
+    def test_table_repair_preserves_a_trailing_newline(self):
+        source = """| Concept | Description |
+| --- | --- |
+| Role | Controls access |
+"""
+        repaired_table = """| 概念 | 描述 |
+| --- | --- |
+| 角色 | 控制访问 |"""
+
+        class FakeAIClient:
+            def chat_completion(self, messages, temperature=0.1):
+                return repaired_table
+
+        repaired, reasons = repair_suspected_untranslated_tables(
+            source,
+            source,
+            FakeAIClient(),
+        )
+
+        self.assertEqual(repaired_table + "\n", repaired)
+        self.assertEqual([], reasons)
 
     def test_trailing_batch_newlines_do_not_trigger_truncation_warning(self):
         class FakeAIClient:

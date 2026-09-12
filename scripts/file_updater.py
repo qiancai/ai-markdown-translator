@@ -2041,6 +2041,8 @@ Instructions:
 4. For changed lines in {source_language}, follow the translation rules below:
 
     - Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
+    - If the changed lines include table headers or table rows, translate the natural-language content in these headers or rows into the {target_language}.
+    - If the changed part of a changed line contains a link, translate only the natural-language part of the link text into the {target_language}, and keep the linked file path in {source_language}.
     - Do NOT translate:
         - Code examples, SQL queries, configuration values, doc variables/placeholders such as {DOC_VARIABLE_EXAMPLE}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
         - Explicit heading anchors such as {{#example-test}} in the section titles.

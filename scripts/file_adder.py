@@ -11,6 +11,12 @@ from github import Github
 from openai import OpenAI
 from file_io import atomic_write_text
 from log_sanitizer import sanitize_exception_message, safe_target_path
+from markdown_table_utils import (
+    extract_markdown_tables,
+    find_suspected_table_omissions,
+    table_shapes_match,
+    validate_repaired_table,
+)
 from workflow_outcome import FileOutcomes
 from product_specific_handler import get_product_name, rewrite_tidb_version_anchors_in_text
 from svg_preprocessor import strip_svgs, restore_svgs
@@ -264,6 +270,174 @@ def preprocess_added_file_batch_for_heading_anchor_stability(batch_content, sour
     return "\n".join(processed_lines)
 
 
+def translate_markdown_table(
+    source_table,
+    current_target_table,
+    ai_client,
+    source_language="English",
+    target_language="Chinese",
+    glossary_matcher=None,
+):
+    """Translate one suspected table while preserving its Markdown structure."""
+    glossary_prompt_section = ""
+    if glossary_matcher:
+        from glossary import filter_terms_for_content, format_terms_for_prompt
+
+        matched_terms = filter_terms_for_content(
+            glossary_matcher,
+            source_table,
+            source_language=source_language,
+        )
+        if matched_terms:
+            glossary_prompt_section = (
+                "\nUse these glossary translations when applicable:\n"
+                + format_terms_for_prompt(
+                    matched_terms,
+                    source_language=source_language,
+                    target_language=target_language,
+                )
+                + "\n"
+            )
+
+    prompt = f"""You are correcting one Markdown table translated from {source_language} to {target_language}.
+
+Translate every natural-language phrase that still needs translation, including text in header cells and body cells. Reuse correct text that is already translated in the current target table.
+
+STRICT STRUCTURE RULES:
+1. Return exactly one complete Markdown table and nothing else.
+2. Preserve every pipe delimiter, the exact separator row, indentation, row count, and column count.
+3. Preserve code spans, SQL, commands, URLs, file paths, placeholders, product names, API names, identifiers, parameter names, numbers, and symbols exactly.
+4. When a column headed "Parameter", "Field", "Setting", "Option", or a similar label contains parameter names, configuration names, or UI field names, preserve those body-cell names exactly as written in the source, even if they contain spaces or lowercase words. Also preserve exact UI action names, status labels, mode names, and option/default values. Translate the column header and descriptive cells normally.
+5. Do not treat the table as a code block. Translate natural-language descriptions even when they appear next to protected technical text.
+6. Do not add explanations or wrap the table in a code fence.
+{glossary_prompt_section}
+Source table:
+{source_table}
+
+Current target table:
+{current_target_table}
+"""
+
+    response = ai_client.chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    incomplete_reason = ""
+    if getattr(response, "completion_status", "complete") == "incomplete":
+        incomplete_reason = (
+            "table repair response incomplete: "
+            + (getattr(response, "completion_reason", "") or "unknown reason")
+        )
+    return strip_ai_markdown_wrapper(response), incomplete_reason
+
+
+def repair_suspected_untranslated_tables(
+    source_content,
+    translated_content,
+    ai_client,
+    source_language="English",
+    target_language="Chinese",
+    glossary_matcher=None,
+):
+    """Run a focused second pass for tables apparently skipped by the model."""
+    source_tables = extract_markdown_tables(source_content)
+    target_tables = extract_markdown_tables(translated_content)
+    if not source_tables and not target_tables:
+        return translated_content, []
+    if len(source_tables) != len(target_tables):
+        return translated_content, [
+            "Markdown table count changed during translation: "
+            f"source {len(source_tables)}, target {len(target_tables)}"
+        ]
+
+    shape_mismatches = [
+        index
+        for index, (source_table, target_table) in enumerate(
+            zip(source_tables, target_tables),
+            1,
+        )
+        if not table_shapes_match(source_table, target_table)
+    ]
+    partial_reasons = [
+        f"Markdown table {index} changed row count or column count"
+        for index in shape_mismatches
+    ]
+    omissions = find_suspected_table_omissions(
+        source_content,
+        translated_content,
+        source_language=source_language,
+    )
+    if not omissions:
+        return translated_content, partial_reasons
+
+    has_trailing_newline = translated_content.endswith(("\n", "\r"))
+    translated_lines = translated_content.splitlines()
+    replacements = []
+    for omission in omissions:
+        thread_safe_print(
+            f"   🔁 Retrying Markdown table {omission.table_index}: "
+            f"{omission.reason}"
+        )
+        try:
+            repaired_response, incomplete_reason = translate_markdown_table(
+                omission.source.text,
+                omission.target.text,
+                ai_client,
+                source_language=source_language,
+                target_language=target_language,
+                glossary_matcher=glossary_matcher,
+            )
+        except Exception as e:
+            partial_reasons.append(
+                f"Markdown table {omission.table_index} repair failed: "
+                f"{sanitize_exception_message(e)}"
+            )
+            continue
+
+        if incomplete_reason:
+            partial_reasons.append(
+                f"Markdown table {omission.table_index}: {incomplete_reason}"
+            )
+            continue
+
+        repaired_table, validation_error = validate_repaired_table(
+            omission.source,
+            repaired_response,
+        )
+        if validation_error:
+            partial_reasons.append(
+                f"Markdown table {omission.table_index} repair rejected: "
+                f"{validation_error}"
+            )
+            continue
+
+        replacements.append(
+            (
+                omission.target.start_line,
+                omission.target.end_line,
+                repaired_table.splitlines(),
+            )
+        )
+
+    for start_line, end_line, replacement_lines in reversed(replacements):
+        translated_lines[start_line:end_line] = replacement_lines
+
+    repaired_content = "\n".join(translated_lines)
+    if has_trailing_newline:
+        repaired_content += "\n"
+    remaining_omissions = find_suspected_table_omissions(
+        source_content,
+        repaired_content,
+        source_language=source_language,
+    )
+    partial_reasons.extend(
+        f"Markdown table {omission.table_index} remains suspicious after repair: "
+        f"{omission.reason}"
+        for omission in remaining_omissions
+    )
+    return repaired_content, partial_reasons
+
+
 def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None, source_mode="", context_reference=None, prior_translation_reference=None):
     """Translate a single batch of file content using AI.
 
@@ -288,6 +462,7 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
         source_mode=source_mode,
     )
 
+    table_source_content = prompt_batch_content
     prompt_batch_content, svg_map = strip_svgs(prompt_batch_content)
     if svg_map:
         thread_safe_print(f"   🖼️  Replaced {len(svg_map)} SVG(s) with placeholders for AI translation")
@@ -336,6 +511,11 @@ Your task is to translate the following {document_description} content from {sou
 
 IMPORTANT INSTRUCTIONS:
 1. Preserve ALL Markdown formatting (headers, links, code blocks, tables, etc.)
+   - For Markdown tables, translate natural-language text in every header cell and body cell if the translating it helps users in the target language better understand the table. Preserve the table syntax, not the source-language prose.
+        - Preserve every pipe delimiter, separator row, indentation, row count, and column count. Keep code spans, identifiers, parameter names, product names, API names, numbers, and symbols unchanged.
+        - In columns headed "Parameter", "Field", "Setting", "Option", or similar, preserve body-cell parameter names, configuration names, and UI field names exactly as written in the source, even when they contain spaces or lowercase words. Also preserve exact UI action names, status labels, mode names, and option/default values. Translate the column header and descriptions normally.
+        - In some scenarios, if keeping certain words in {source_language} is much better and common than translating them to {target_language}, keep them in {source_language} is OK. For example, "AWS access key" is better to keep in English.
+    - For internal Markdown links such as [link text](/path/to/file.md#section-name), only translate the natural-language part in the link text to the {target_language}, and keep the linked file name and section name exactly the same as written in the source.
 2. Do NOT translate:
    - Code examples, SQL queries, configuration values, doc variables/placeholders such as {doc_variable_example}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
    - `<CustomContent ...>` and `</CustomContent>` tags. Preserve each tag, its attributes, and its placement exactly, while translating natural-language text inside inline `CustomContent` normally.
@@ -408,6 +588,15 @@ Glossary for terms in {source_language} and {target_language}:
         target_language,
         source_mode=source_mode,
     )
+    translated_content, table_partial_reasons = repair_suspected_untranslated_tables(
+        table_source_content,
+        translated_content,
+        ai_client,
+        source_language=source_language,
+        target_language=target_language,
+        glossary_matcher=glossary_matcher,
+    )
+    partial_reasons.extend(table_partial_reasons)
 
     translated_line_count = len(
         translated_content.rstrip("\r\n").splitlines()
