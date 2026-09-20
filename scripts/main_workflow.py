@@ -36,6 +36,7 @@ from diff_analyzer import (
     analyze_source_changes,
     build_diff_text,
     build_pr_diff_context,
+    get_source_file_content,
     get_repo_config,
     get_target_hierarchy_and_content,
     get_source_file_hierarchy,
@@ -44,13 +45,14 @@ from diff_analyzer import (
 from image_processor import process_all_images
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
+from file_io import atomic_write_text, read_safe_target_text
 from file_updater import process_files_in_batches, process_added_sections, process_modified_sections
 from formatting_sync import apply_formatting_only_change_with_ai_fallback
 from toc_processor import process_toc_file
 from keword_processor import process_keyword_file
 from section_matcher import match_source_diff_to_target
 from glossary import load_glossary, create_glossary_matcher
-from log_sanitizer import sanitize_exception_message
+from log_sanitizer import sanitize_exception_message, safe_target_path
 from parallel_file_processor import (
     count_unique_file_paths,
     make_file_task,
@@ -59,6 +61,7 @@ from parallel_file_processor import (
     should_parallelize_file_processing,
 )
 from special_file_utils import is_index_file_name, is_toc_file_name, path_resource_key
+from structural_reconciler import reconcile_restructured_file
 from workflow_ignore_config import load_workflow_ignore_config
 from workflow_outcome import RunReport, record_file_task_result
 
@@ -206,6 +209,138 @@ def git_add_successful_task_changes(task_results, target_repo_path):
 
     # Keep staging out of worker threads so git add never races with active file writes.
     git_add_changes(target_repo_path)
+
+
+def reconcile_restructured_files_for_pr(
+    restructured_files,
+    added_files,
+    source_context,
+    github_client,
+    ai_client,
+    repo_config,
+    glossary_matcher,
+    run_report,
+):
+    """Handle PR-mode restructured files without full-file overwrite.
+
+    Source section moves need the structural reconciler, which reuses existing
+    target-language sections for unchanged content. If reconciliation fails,
+    preserve the existing target file and mark the file as failed instead of
+    falling back to destructive full-file translation.
+    """
+    reconciled_paths = set()
+    failed_paths = set()
+    source_mode = (
+        source_context.get("mode", "pr")
+        if isinstance(source_context, dict)
+        else "pr"
+    )
+
+    for file_path in sorted(restructured_files):
+        existing_target = read_safe_target_text(TARGET_REPO_PATH, file_path)
+        if not existing_target:
+            thread_safe_print(
+                f"   ℹ️  Reconciler: no existing target for {file_path}; "
+                "using full translation"
+            )
+            continue
+
+        def mark_reconciliation_failure(reason):
+            thread_safe_print(
+                f"   ❌ Reconciler: {reason}; preserving existing target file"
+            )
+            run_report.mark_failure(file_path, reason)
+            failed_paths.add(file_path)
+
+        try:
+            head_source = get_source_file_content(
+                file_path,
+                source_context,
+                github_client,
+                ref_name="head_ref",
+            )
+            base_source = get_source_file_content(
+                file_path,
+                source_context,
+                github_client,
+                ref_name="base_ref",
+            )
+        except Exception as error:
+            mark_reconciliation_failure(
+                f"could not load source for {file_path}: "
+                f"{sanitize_exception_message(error)}"
+            )
+            continue
+
+        missing_snapshots = [
+            label
+            for label, content in (("HEAD", head_source), ("BASE", base_source))
+            if content is None
+        ]
+        if missing_snapshots:
+            if len(missing_snapshots) == 1:
+                missing_detail = f"{missing_snapshots[0]} source snapshot is unavailable"
+            else:
+                missing_detail = (
+                    f"{' and '.join(missing_snapshots)} source snapshots are unavailable"
+                )
+            mark_reconciliation_failure(
+                f"{missing_detail} for {file_path}"
+            )
+            continue
+
+        try:
+            reconciled = reconcile_restructured_file(
+                file_path,
+                head_source,
+                base_source,
+                existing_target,
+                ai_client,
+                repo_config,
+                glossary_matcher=glossary_matcher,
+                source_mode=source_mode,
+            )
+        except Exception as error:
+            mark_reconciliation_failure(
+                f"reconciliation raised for {file_path}: "
+                f"{sanitize_exception_message(error)}"
+            )
+            continue
+
+        if reconciled is None:
+            mark_reconciliation_failure(
+                f"structure-preserving reconciliation declined {file_path}"
+            )
+            continue
+
+        try:
+            target_file_path = safe_target_path(TARGET_REPO_PATH, file_path)
+        except ValueError as error:
+            mark_reconciliation_failure(sanitize_exception_message(error))
+            continue
+
+        try:
+            atomic_write_text(target_file_path, reconciled)
+        except Exception as error:
+            mark_reconciliation_failure(
+                f"failed to write {target_file_path}: "
+                f"{sanitize_exception_message(error)}"
+            )
+            continue
+
+        thread_safe_print(f"   ✅ Reconciled (structure-preserving): {file_path}")
+        run_report.mark_success(file_path)
+        reconciled_paths.add(file_path)
+
+    for file_path in reconciled_paths | failed_paths:
+        added_files.pop(file_path, None)
+        restructured_files.discard(file_path)
+
+    if reconciled_paths:
+        git_add_changes(TARGET_REPO_PATH)
+
+    return reconciled_paths
+
 
 def estimate_tokens(text):
     """Calculate accurate token count using tiktoken (GPT-4/3.5 encoding)"""
@@ -1031,16 +1166,30 @@ def main():
             for path, data in formatting_files.items()
             if path in requested_source_files
         }
-    # Restructured files were rerouted to added_files by detect_restructured_file()
-    # in analyze_source_changes(). They need overwrite_existing=True because the
-    # target file already exists.
+        restructured_files = {
+            path for path in restructured_files if path in requested_source_files
+        }
+    # Restructured files are initially queued in added_files by
+    # analyze_source_changes(). For existing target files, reconcile the
+    # structure while reusing unchanged translations before the added-file path
+    # can overwrite the whole document.
     if restructured_files:
         thread_safe_print(
             f"\n🔄 Restructured files detected ({len(restructured_files)}), "
-            "will use full translation with overwrite:"
+            "will use structure-preserving reconciliation when possible:"
         )
         for path in sorted(restructured_files):
             thread_safe_print(f"   - {path}")
+        reconcile_restructured_files_for_pr(
+            restructured_files,
+            added_files,
+            source_context,
+            github_client,
+            ai_client,
+            repo_config,
+            glossary_matcher,
+            run_report,
+        )
     diff_file_count = count_unique_file_paths(
         added_sections,
         modified_sections,

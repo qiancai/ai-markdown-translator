@@ -69,7 +69,7 @@ from file_updater import (
 )
 from structural_reconciler import reconcile_restructured_file
 from file_deleter import process_deleted_files
-from file_io import atomic_write_text
+from file_io import atomic_write_text, read_safe_target_text
 from formatting_sync import apply_formatting_only_change_with_ai_fallback
 from glossary import create_glossary_matcher, load_glossary
 from image_processor import process_all_images
@@ -400,12 +400,7 @@ def get_safe_target_file_path(target_repo_path, source_file_path):
 
 
 def read_target_file_content(target_repo_path, source_file_path):
-    target_file_path = get_safe_target_file_path(target_repo_path, source_file_path)
-    if not target_file_path or not os.path.exists(target_file_path):
-        return None
-
-    with open(target_file_path, "r", encoding="utf-8") as f:
-        return f.read()
+    return read_safe_target_text(target_repo_path, source_file_path)
 
 
 def load_retry_cursor_groups(target_repo_path):

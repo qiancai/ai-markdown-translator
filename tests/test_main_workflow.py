@@ -118,6 +118,111 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
 
 
 class MainWorkflowRegressionTest(unittest.TestCase):
+    def test_restructured_pr_file_uses_reconciler_instead_of_full_overwrite(self):
+        added_files = {"guide.md": "# Guide\n\n## B\n\nNew\n"}
+        restructured_files = {"guide.md"}
+        run_report = main_workflow.RunReport()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_file = Path(tmpdir) / "guide.md"
+            target_file.write_text("# 指南\n\n## A\n\n旧译文\n", encoding="utf-8")
+
+            def fake_source(file_path, _context, _github_client, ref_name="head_ref"):
+                self.assertEqual(file_path, "guide.md")
+                if ref_name == "head_ref":
+                    return "# Guide\n\n## B\n\nNew\n"
+                if ref_name == "base_ref":
+                    return "# Guide\n\n## A\n\nOld\n"
+                raise AssertionError(ref_name)
+
+            with mock.patch.object(main_workflow, "TARGET_REPO_PATH", tmpdir), \
+                mock.patch.object(main_workflow, "get_source_file_content", side_effect=fake_source), \
+                mock.patch.object(main_workflow, "reconcile_restructured_file", return_value="# 指南\n\n## B\n\n新译文\n") as reconcile, \
+                mock.patch.object(main_workflow, "git_add_changes") as git_add:
+                reconciled = main_workflow.reconcile_restructured_files_for_pr(
+                    restructured_files,
+                    added_files,
+                    {"mode": "pr"},
+                    object(),
+                    object(),
+                    {"source_language": "Chinese", "target_language": "English"},
+                    None,
+                    run_report,
+                )
+            final_content = target_file.read_text(encoding="utf-8")
+
+        self.assertEqual({"guide.md"}, reconciled)
+        self.assertEqual({}, added_files)
+        self.assertEqual(set(), restructured_files)
+        self.assertEqual(["guide.md"], run_report.succeeded)
+        self.assertEqual("# 指南\n\n## B\n\n新译文\n", final_content)
+        reconcile.assert_called_once()
+        git_add.assert_called_once_with(tmpdir)
+
+    def test_restructured_pr_reconciliation_failure_does_not_fall_back_to_overwrite(self):
+        added_files = {"guide.md": "# Guide\n\n## B\n\nNew\n"}
+        restructured_files = {"guide.md"}
+        run_report = main_workflow.RunReport()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_file = Path(tmpdir) / "guide.md"
+            original = "# 指南\n\n## A\n\n旧译文\n"
+            target_file.write_text(original, encoding="utf-8")
+
+            with mock.patch.object(main_workflow, "TARGET_REPO_PATH", tmpdir), \
+                mock.patch.object(main_workflow, "get_source_file_content", return_value="# Guide\n"), \
+                mock.patch.object(main_workflow, "reconcile_restructured_file", return_value=None), \
+                mock.patch.object(main_workflow, "git_add_changes") as git_add:
+                reconciled = main_workflow.reconcile_restructured_files_for_pr(
+                    restructured_files,
+                    added_files,
+                    {"mode": "pr"},
+                    object(),
+                    object(),
+                    {"source_language": "Chinese", "target_language": "English"},
+                    None,
+                    run_report,
+                )
+            final_content = target_file.read_text(encoding="utf-8")
+
+        self.assertEqual(set(), reconciled)
+        self.assertEqual({}, added_files)
+        self.assertEqual(set(), restructured_files)
+        self.assertEqual(original, final_content)
+        self.assertEqual(1, len(run_report.failed))
+        self.assertIn("declined", run_report.failed[0][1])
+        git_add.assert_not_called()
+
+    def test_restructured_pr_reports_plural_missing_source_snapshots(self):
+        added_files = {"guide.md": "# Guide\n"}
+        restructured_files = {"guide.md"}
+        run_report = main_workflow.RunReport()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_file = Path(tmpdir) / "guide.md"
+            target_file.write_text("# 指南\n", encoding="utf-8")
+
+            with mock.patch.object(main_workflow, "TARGET_REPO_PATH", tmpdir), \
+                mock.patch.object(main_workflow, "get_source_file_content", return_value=None), \
+                mock.patch.object(main_workflow, "reconcile_restructured_file") as reconcile:
+                main_workflow.reconcile_restructured_files_for_pr(
+                    restructured_files,
+                    added_files,
+                    {"mode": "pr"},
+                    object(),
+                    object(),
+                    {"source_language": "Chinese", "target_language": "English"},
+                    None,
+                    run_report,
+                )
+
+        self.assertEqual(1, len(run_report.failed))
+        self.assertIn(
+            "HEAD and BASE source snapshots are unavailable",
+            run_report.failed[0][1],
+        )
+        reconcile.assert_not_called()
+
     def test_workflow_repo_configs_accepts_pr_files_range_source_url(self):
         with mock.patch.object(
             main_workflow,
