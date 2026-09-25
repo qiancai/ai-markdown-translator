@@ -21,6 +21,10 @@ TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 SOURCE_FILES = os.getenv("SOURCE_FILES", "")
 SKIP_GIT_ADD = os.getenv("SKIP_GIT_ADD", "false").lower() == "true"
 PREFER_LOCAL_TARGET_FOR_READ = os.getenv("PREFER_LOCAL_TARGET_FOR_READ", "true").lower() == "true"
+FINALIZE_INTERNAL_LINK_TITLES = (
+    os.getenv("FINALIZE_INTERNAL_LINK_TITLES", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
     "https://docs.pingcap.com/tidbcloud/",
@@ -43,6 +47,10 @@ from diff_analyzer import (
     parse_pr_url,
 )
 from image_processor import process_all_images
+from internal_link_title_finalizer import (
+    capture_target_snapshots,
+    finalize_internal_link_titles,
+)
 from file_adder import process_added_files
 from file_deleter import process_deleted_files
 from file_io import atomic_write_text, read_safe_target_text
@@ -1122,6 +1130,11 @@ def main():
         sys.exit(1)
     repo_config = source_context["repo_config"]
     pr_diff = build_diff_text(source_context["changed_files"])
+    target_snapshots_before_translation = (
+        capture_target_snapshots(source_context["changed_files"], TARGET_REPO_PATH)
+        if FINALIZE_INTERNAL_LINK_TITLES
+        else {}
+    )
     thread_safe_print(f"📋 Source diff: {source_context['source_description']}")
     if pr_diff:
         thread_safe_print(f"✅ Got PR diff: {len(pr_diff)} characters")
@@ -1463,6 +1476,44 @@ def main():
         run_report.record_outcomes(image_outcomes)
         thread_safe_print(f"   ✅ Images processed")
         git_add_changes(TARGET_REPO_PATH)
+
+    # Step 3.7: Finalize internal link titles after every translated file has
+    # landed, so cross-file heading references can see the final target state.
+    if FINALIZE_INTERNAL_LINK_TITLES:
+        thread_safe_print(
+            "\n🔗 Step 3.7: Finalizing internal link titles on changed target lines..."
+        )
+
+        def load_source_head(path):
+            try:
+                return get_source_file_content(
+                    path,
+                    source_context,
+                    github_client,
+                    ref_name="head_ref",
+                )
+            except Exception as error:
+                thread_safe_print(
+                    f"   ⚠️  Could not load source HEAD for link title finalizer "
+                    f"{path}: {sanitize_exception_message(error)}"
+                )
+                return None
+
+        finalized_replacements = finalize_internal_link_titles(
+            source_context["changed_files"],
+            TARGET_REPO_PATH,
+            target_snapshots_before_translation,
+            load_source_head,
+            printer=thread_safe_print,
+        )
+        if finalized_replacements:
+            thread_safe_print(
+                f"   ✅ Internal link title finalizer applied "
+                f"{finalized_replacements} replacement(s)"
+            )
+            git_add_changes(TARGET_REPO_PATH)
+        else:
+            thread_safe_print("   ✅ No internal link title replacements needed")
     
     # Final summary
     thread_safe_print(f"\n" + "="*80)

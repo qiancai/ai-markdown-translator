@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -103,9 +104,14 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
             main_workflow, "process_all_images"
         ) as process_all_images, mock.patch.object(
             main_workflow, "git_add_changes"
-        ):
+        ), mock.patch.object(
+            main_workflow, "FINALIZE_INTERNAL_LINK_TITLES", False
+        ), mock.patch.object(
+            main_workflow, "capture_target_snapshots"
+        ) as capture_snapshots:
             main_workflow.main()
 
+        capture_snapshots.assert_not_called()
         self.assertIs(analyze_source_changes.call_args.args[0], source_context)
         process_all_images.assert_called_once_with(
             ["docs/media/example.png"],
@@ -115,6 +121,129 @@ class MainWorkflowImageOnlyPrTest(unittest.TestCase):
             fake_github_client,
             repo_config,
         )
+
+
+class MainWorkflowLinkFinalizerTest(unittest.TestCase):
+    def test_pr_finalizer_reads_headings_after_all_modified_files_are_written(self):
+        repo_config = {
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "target_local_path": "",
+            "source_language": "English",
+            "target_language": "Chinese",
+        }
+        guide_diff = SimpleNamespace(
+            filename="guide.md",
+            status="modified",
+            patch="@@ -3 +3 @@\n+See [Connect](other.md#connect).\n",
+        )
+        other_diff = SimpleNamespace(
+            filename="other.md",
+            status="modified",
+            patch="@@ -2 +2 @@\n+## Connect {#connect}\n",
+        )
+        source_context = {
+            "mode": "pr",
+            "source_repo": "acme/docs",
+            "target_repo": "acme/docs-cn",
+            "head_ref": "head",
+            "changed_files": [guide_diff, other_diff],
+            "repo_config": repo_config,
+            "source_description": "PR #1",
+        }
+        source_files = {
+            "guide.md": "# Guide\n\nSee [Connect](other.md#connect).\n",
+            "other.md": "# Other\n## Connect {#connect}\n",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_config["target_local_path"] = tmpdir
+            guide = Path(tmpdir, "guide.md")
+            other = Path(tmpdir, "other.md")
+            guide.write_text("# 指南\n\n旧行。\n", encoding="utf-8")
+            other.write_text("# Other\n## Old {#connect}\n", encoding="utf-8")
+
+            def translate(path, *_args):
+                if path == "guide.md":
+                    guide.write_text(
+                        "# 指南\n\n参阅 [错译](other.md#connect)。\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    self.assertIn("[错译]", guide.read_text(encoding="utf-8"))
+                    other.write_text("# Other\n## 连接 {#connect}\n", encoding="utf-8")
+                return main_workflow.make_task_result("success")
+
+            with ExitStack() as stack:
+                settings = {
+                    "SOURCE_PR_URL": "https://github.com/acme/docs/pull/1",
+                    "TARGET_PR_URL": "https://github.com/acme/docs-cn/pull/2",
+                    "GITHUB_TOKEN": "token",
+                    "TARGET_REPO_PATH": tmpdir,
+                    "SOURCE_FILES": "",
+                    "FINALIZE_INTERNAL_LINK_TITLES": True,
+                }
+                for name, value in settings.items():
+                    stack.enter_context(mock.patch.object(main_workflow, name, value))
+                stack.enter_context(mock.patch.object(main_workflow, "clean_temp_output_dir"))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "ensure_temp_output_dir", return_value=tmpdir
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "get_workflow_repo_configs",
+                    return_value={"acme/docs": repo_config},
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "get_workflow_repo_config", return_value=repo_config
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow.Auth, "Token", return_value="auth"
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "Github", return_value=object()
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "UnifiedAIClient",
+                    return_value=SimpleNamespace(model="fake"),
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "load_glossary", return_value=[]
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "create_glossary_matcher", return_value=None
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "build_pr_diff_context", return_value=source_context
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "analyze_source_changes",
+                    return_value=(
+                        {}, {"guide.md": {}, "other.md": {}}, {}, {}, [],
+                        {}, {}, [], [], [], set(), {}, {},
+                    ),
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "should_parallelize_file_processing",
+                    return_value=False,
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "_process_single_modified_file_for_pr",
+                    side_effect=translate,
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "get_source_file_content",
+                    side_effect=lambda path, *_args, **_kwargs: source_files[path],
+                ))
+                stack.enter_context(mock.patch.object(
+                    main_workflow, "git_add_successful_task_changes"
+                ))
+                stack.enter_context(mock.patch.object(main_workflow, "git_add_changes"))
+                stack.enter_context(mock.patch.object(
+                    main_workflow.RunReport, "write_failure_report"
+                ))
+                main_workflow.main()
+
+            self.assertIn("[连接](other.md#connect)", guide.read_text(encoding="utf-8"))
 
 
 class MainWorkflowRegressionTest(unittest.TestCase):

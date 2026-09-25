@@ -2721,5 +2721,151 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertEqual(1, len(stats.structure_errors))
 
 
+class CommitSyncLinkFinalizerTest(unittest.TestCase):
+    def test_waits_for_all_cursor_groups_and_keeps_first_snapshot(self):
+        guide_diff = SimpleNamespace(
+            filename="guide.md",
+            status="modified",
+            patch="@@ -3 +3 @@\n+See [Connect](other.md#connect).\n",
+        )
+        guide_diff_from_marker = SimpleNamespace(
+            filename="guide.md",
+            status="modified",
+            patch="@@ -2,1 +3 @@\n+See [Connect](other.md#connect).\n",
+        )
+        other_diff = SimpleNamespace(
+            filename="other.md",
+            status="modified",
+            patch="@@ -2 +2 @@\n+## Connect {#connect}\n",
+        )
+        global_context = {"changed_files": [guide_diff, other_diff], "head_ref": "head"}
+        marker_context = {
+            "changed_files": [guide_diff, guide_diff_from_marker, other_diff],
+            "head_ref": "head",
+        }
+        counts = {
+            "added_files": 0,
+            "deleted_files": 0,
+            "toc_files": 0,
+            "keyword_files": 0,
+            "index_files": 0,
+            "formatting_files": 0,
+            "modified_sections": 0,
+            "added_images": 0,
+            "modified_images": 0,
+            "deleted_images": 0,
+        }
+        source_files = {
+            "guide.md": "# Guide\n\nSee [Connect](other.md#connect).\n",
+            "other.md": "# Other\n## Connect {#connect}\n",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            guide = Path(tmpdir, "guide.md")
+            other = Path(tmpdir, "other.md")
+            guide.write_text("# 指南\n\n旧行。\n", encoding="utf-8")
+            other.write_text("# Other\n## Old {#connect}\n", encoding="utf-8")
+            group_labels = []
+
+            def process_group(group_label, **kwargs):
+                group_labels.append(group_label)
+                if len(group_labels) == 1:
+                    guide.write_text(
+                        "# 指南\n\n参阅 [错译](other.md#connect)。\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    self.assertIn("[错译]", guide.read_text(encoding="utf-8"))
+                    other.write_text("# Other\n## 连接 {#connect}\n", encoding="utf-8")
+                return {
+                    "attempted": True,
+                    "successful_file_paths": {
+                        file.filename for file in kwargs["filtered_changed_files"]
+                    },
+                    "counts": counts,
+                }
+
+            with ExitStack() as stack:
+                settings = {
+                    "SOURCE_REPO": "acme/docs",
+                    "TARGET_REPO": "acme/docs-cn",
+                    "GITHUB_TOKEN": "token",
+                    "TARGET_REPO_PATH": tmpdir,
+                    "SOURCE_BASE_REF": "base",
+                    "SOURCE_HEAD_REF": "head",
+                    "SOURCE_FILES": "",
+                    "SOURCE_FOLDER": "",
+                    "SOURCE_FULL_FILES": "",
+                    "SOURCE_FILES_TRANSLATION_MODE": "incremental",
+                    "COMMIT_SYNC_RUN_TYPE": "scheduled",
+                    "SOURCE_REPO_PATH": "",
+                    "TARGET_REF": "",
+                    "FINALIZE_INTERNAL_LINK_TITLES": True,
+                }
+                for name, value in settings.items():
+                    stack.enter_context(mock.patch.object(workflow, name, value))
+                stack.enter_context(mock.patch.object(workflow, "clean_temp_output_dir"))
+                stack.enter_context(mock.patch.object(workflow.Auth, "Token", return_value="auth"))
+                stack.enter_context(mock.patch.object(workflow, "Github", return_value=object()))
+                stack.enter_context(mock.patch.object(
+                    workflow, "UnifiedAIClient", return_value=SimpleNamespace(model="fake")
+                ))
+                stack.enter_context(mock.patch.object(workflow, "load_glossary", return_value=[]))
+                stack.enter_context(mock.patch.object(workflow, "create_glossary_matcher", return_value=None))
+                stack.enter_context(mock.patch.object(
+                    workflow, "build_incremental_diff_context",
+                    side_effect=[global_context, marker_context],
+                ))
+                stack.enter_context(mock.patch.object(
+                    workflow, "split_changed_files_by_corresponding_en_commit",
+                    return_value=(
+                        [guide_diff],
+                        {"marker": {"guide.md", "other.md"}},
+                        {"guide.md", "other.md"},
+                    ),
+                ))
+                stack.enter_context(mock.patch.object(
+                    workflow, "load_retry_cursor_groups", return_value=({}, set())
+                ))
+                stack.enter_context(mock.patch.object(
+                    workflow, "process_translation_group", side_effect=process_group
+                ))
+                stack.enter_context(mock.patch.object(
+                    workflow, "get_source_ref_content",
+                    side_effect=lambda path, *_: source_files[path],
+                ))
+                finalize_links = stack.enter_context(mock.patch.object(
+                    workflow, "finalize_internal_link_titles",
+                    wraps=workflow.finalize_internal_link_titles,
+                ))
+                stack.enter_context(mock.patch.object(
+                    workflow, "update_corresponding_en_commit_for_files",
+                    return_value=([], {}),
+                ))
+                stack.enter_context(mock.patch.object(
+                    workflow, "update_retry_cursor_ledger", return_value=False
+                ))
+                stack.enter_context(mock.patch.object(workflow, "git_add_changes"))
+                stack.enter_context(mock.patch.object(
+                    workflow.TranslationStats, "write_failure_report"
+                ))
+                result = workflow.main()
+
+            self.assertEqual(0, result)
+            self.assertEqual(2, len(group_labels))
+            self.assertEqual(
+                ["guide.md", "guide.md", "other.md"],
+                [file.filename for file in finalize_links.call_args.args[0]],
+            )
+            self.assertEqual(
+                [guide_diff.patch, guide_diff_from_marker.patch],
+                [
+                    file.patch for file in finalize_links.call_args.args[0]
+                    if file.filename == "guide.md"
+                ],
+            )
+            self.assertIn("[连接](other.md#connect)", guide.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

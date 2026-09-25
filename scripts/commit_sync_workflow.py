@@ -40,6 +40,10 @@ TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH")
 TERMS_PATH = os.getenv("TERMS_PATH", "")
 FAIL_ON_TRANSLATION_ERROR = os.getenv("FAIL_ON_TRANSLATION_ERROR", "false").lower() == "true"
 COMMIT_SYNC_RUN_TYPE = os.getenv("COMMIT_SYNC_RUN_TYPE", os.getenv("GITHUB_EVENT_NAME", ""))
+FINALIZE_INTERNAL_LINK_TITLES = (
+    os.getenv("FINALIZE_INTERNAL_LINK_TITLES", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
 TIDB_CLOUD_ABSOLUTE_LINK_PREFIX = os.getenv(
     "TIDB_CLOUD_ABSOLUTE_LINK_PREFIX",
     "https://docs.pingcap.com/tidbcloud/",
@@ -73,6 +77,10 @@ from file_io import atomic_write_text, read_safe_target_text
 from formatting_sync import apply_formatting_only_change_with_ai_fallback
 from glossary import create_glossary_matcher, load_glossary
 from image_processor import process_all_images
+from internal_link_title_finalizer import (
+    capture_target_snapshots,
+    finalize_internal_link_titles,
+)
 from keword_processor import process_keyword_file
 from log_sanitizer import sanitize_exception_message, safe_target_path
 from parallel_file_processor import (
@@ -2087,6 +2095,32 @@ def main():
     glossary_matcher = create_glossary_matcher(glossary)
     translation_stats = TranslationStats()
     all_successful_file_paths = set()
+    link_changed_files = []
+    seen_link_diffs = set()
+    target_snapshots_before_translation = {}
+
+    def collect_link_finalizer_input(changed_files):
+        if not FINALIZE_INTERNAL_LINK_TITLES:
+            return
+        for file in changed_files:
+            diff_key = (
+                getattr(file, "filename", ""),
+                getattr(file, "previous_filename", None),
+                getattr(file, "status", ""),
+                getattr(file, "patch", None),
+            )
+            if diff_key not in seen_link_diffs:
+                link_changed_files.append(file)
+                seen_link_diffs.add(diff_key)
+        uncaptured_files = [
+            file for file in changed_files
+            if getattr(file, "filename", "") not in target_snapshots_before_translation
+        ]
+        for path, content in capture_target_snapshots(
+            uncaptured_files, TARGET_REPO_PATH
+        ).items():
+            target_snapshots_before_translation[path] = content
+
     marker_aligned_file_paths = set()
     marker_file_paths = set()
     total_counts = {
@@ -2222,6 +2256,7 @@ def main():
         if filtered_changed_files or SOURCE_FULL_FILES.strip():
             diff_context["changed_files"] = filtered_changed_files
             pr_diff = build_diff_text(filtered_changed_files)
+            collect_link_finalizer_input(filtered_changed_files)
             group_result = process_translation_group(
                 f"global cursor {base_ref}...{head_ref}",
                 source_files_translation_mode="incremental",
@@ -2292,6 +2327,7 @@ def main():
                 continue
 
             marker_pr_diff = build_diff_text(marker_filtered_changed_files)
+            collect_link_finalizer_input(marker_filtered_changed_files)
             group_result = process_translation_group(
                 f"per-file cursor {marker_ref}...{head_ref}",
                 source_files_translation_mode="incremental",
@@ -2310,6 +2346,39 @@ def main():
             )
             all_successful_file_paths.update(group_result["successful_file_paths"])
             add_counts(total_counts, group_result["counts"])
+
+    if FINALIZE_INTERNAL_LINK_TITLES and link_changed_files:
+        thread_safe_print(
+            "\n🔗 Finalizing internal link titles on changed target lines..."
+        )
+
+        def load_source_head(path):
+            try:
+                return get_source_ref_content(
+                    path, diff_context, github_client, "head_ref"
+                )
+            except Exception as error:
+                thread_safe_print(
+                    "   ⚠️  Could not load source HEAD for link title finalizer "
+                    f"{path}: {sanitize_exception_message(error)}"
+                )
+                return None
+
+        finalized_replacements = finalize_internal_link_titles(
+            link_changed_files,
+            TARGET_REPO_PATH,
+            target_snapshots_before_translation,
+            load_source_head,
+            printer=thread_safe_print,
+        )
+        if finalized_replacements:
+            thread_safe_print(
+                "   ✅ Internal link title finalizer applied "
+                f"{finalized_replacements} replacement(s)"
+            )
+            git_add_changes(TARGET_REPO_PATH)
+        else:
+            thread_safe_print("   ✅ No internal link title replacements needed")
 
     if run_type in {"manual", "scheduled"}:
         add_if_missing = run_type == "manual"
