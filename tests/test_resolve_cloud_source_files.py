@@ -256,6 +256,36 @@ class ResolveCloudSourceFilesTest(unittest.TestCase):
 
         self.assertEqual(resolved, ["TOC-tidb-cloud.md", "shared/newly-linked.md"])
 
+    def test_legacy_toc_scope_added_keyword_includes_unchanged_files(self):
+        resolved = resolve_source_files(
+            {"TOC-tidb-cloud.md"},
+            changed_rows=[{"filename": "TOC-tidb-cloud.md"}],
+            toc_scope_added_files={"shared/newly-linked.md"},
+        )
+        self.assertEqual(resolved, ["TOC-tidb-cloud.md", "shared/newly-linked.md"])
+
+    def test_legacy_and_current_include_keywords_are_combined_and_normalized(self):
+        resolved = resolve_source_files(
+            set(),
+            always_include_files={"/shared/new.md", "shared/bootstrap.md"},
+            toc_scope_added_files={"shared/new.md", "./shared/legacy.md"},
+        )
+        self.assertEqual(resolved, ["shared/bootstrap.md", "shared/legacy.md", "shared/new.md"])
+
+    def test_legacy_keyword_preserves_explicit_file_filter(self):
+        resolved = resolve_source_files(
+            {"tidb-cloud/selected.md"}, input_file_names="selected.md",
+            toc_scope_added_files={"shared/newly-linked.md"},
+        )
+        self.assertEqual(resolved, ["tidb-cloud/selected.md"])
+
+    def test_legacy_keyword_allows_explicit_newly_linked_file(self):
+        resolved = resolve_source_files(
+            set(), input_file_names="shared/newly-linked.md",
+            toc_scope_added_files={"shared/newly-linked.md"},
+        )
+        self.assertEqual(resolved, ["shared/newly-linked.md"])
+
     def test_collect_toc_scope_added_files_uses_base_and_head_tocs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

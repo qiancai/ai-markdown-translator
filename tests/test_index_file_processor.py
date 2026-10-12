@@ -3,6 +3,10 @@ import os
 import sys
 import tempfile
 import unittest
+import io
+from contextlib import redirect_stdout
+from unittest import mock
+from markdown_it import MarkdownIt
 from pathlib import Path
 
 
@@ -24,31 +28,6 @@ from index_file_processor import (
 # ---------------------------------------------------------------------------
 # Fake AI client for deterministic tests
 # ---------------------------------------------------------------------------
-
-class FakeAIClient:
-    """Return pre-canned translations keyed on substrings found in the prompt."""
-
-    def chat_completion(self, messages, temperature=0.1):
-        prompt = messages[0]["content"]
-        translations = {}
-
-        if "TiDB Cloud Dedicated" in prompt:
-            for key in ("line_0", "line_1", "line_2"):
-                if key == "line_0":
-                    translations[key] = (
-                        '<LearningPathContainer platform="tidb-cloud" '
-                        'title="TiDB Cloud Dedicated" '
-                        'subTitle="TiDB Cloud Dedicated 专为关键任务业务设计，提供跨多个可用区的高可用性、水平扩展和完整的 HTAP 能力。">'
-                    )
-        if "Developer Guide Overview" in prompt:
-            translations.setdefault("line_0", "[开发者指南概览](https://docs.pingcap.com/developer/)")
-        if "Quick Start" in prompt:
-            translations.setdefault("line_1", "[快速入门](https://docs.pingcap.com/developer/dev-guide-build-cluster-in-cloud/)")
-        if "Connect to TiDB" in prompt:
-            translations.setdefault("line_2", "[连接到 TiDB](https://docs.pingcap.com/developer/dev-guide-connect-to-tidb/)")
-
-        return json.dumps(translations, ensure_ascii=False)
-
 
 class EchoAIClient:
     """Return the input lines unchanged (echo them back as-is)."""
@@ -279,12 +258,8 @@ class TestBuildTranslationMemory(unittest.TestCase):
         )
 
 
-    def test_duplicate_url_different_display_text(self):
-        """When two base links share the same URL but differ in display text,
-        each should map to its own target translation (no cross-contamination).
-        This reproduces the bug where CSV and Parquet links both pointed to
-        import-csv-files, causing the CSV position to receive the Parquet
-        translation."""
+    def test_duplicate_url_does_not_guess_translation(self):
+        """A repeated URL cannot identify translated labels reliably."""
         base_lines = [
             "[From CSV Files](https://docs.pingcap.com/tidbcloud/import-csv-files)",
             "[From Apache Parquet Files](https://docs.pingcap.com/tidbcloud/import-csv-files)",
@@ -298,10 +273,9 @@ class TestBuildTranslationMemory(unittest.TestCase):
         csv_key = ("link", "https://docs.pingcap.com/tidbcloud/import-csv-files", "From CSV Files")
         parquet_key = ("link", "https://docs.pingcap.com/tidbcloud/import-csv-files", "From Apache Parquet Files")
 
-        self.assertIn(csv_key, target_map)
-        self.assertIn(parquet_key, target_map)
-        self.assertIn("从 CSV 文件导入", target_map[csv_key])
-        self.assertIn("从 Apache Parquet 文件导入", target_map[parquet_key])
+        self.assertIn(csv_key, base_map)
+        self.assertIn(parquet_key, base_map)
+        self.assertEqual(target_map, {})
 
 
 class TestLocalizeDocsAbsoluteLinks(unittest.TestCase):
@@ -431,14 +405,8 @@ class TestPlanSyncedIndexLines(unittest.TestCase):
         )
         self.assertTrue(len(to_translate) > 0)
 
-    def test_duplicate_url_only_changed_line_sent_to_ai(self):
-        """When two links share a URL and one gets a URL fix, the unchanged
-        link must keep its original target translation and only the changed
-        link should be sent for AI translation.
-
-        Reproduces the dedicated/_index.md bug where both the CSV and Parquet
-        entries pointed to import-csv-files.  Fixing the Parquet URL should
-        NOT corrupt the CSV translation."""
+    def test_duplicate_url_retranslates_ambiguous_labels(self):
+        """A URL correction must not reuse labels from an ambiguous pair."""
         source_base = "\n".join([
             '<LearningPath label="Migrate" icon="cloud3">',
             "",
@@ -476,22 +444,9 @@ class TestPlanSyncedIndexLines(unittest.TestCase):
             for line in planned
         )
 
-        # CSV line must keep its own translation, NOT the Parquet translation
-        self.assertIn("从 CSV 文件导入", result_text)
-        self.assertNotIn(
-            "[从 Apache Parquet 文件导入](https://docs.pingcap.com/zh/tidbcloud/import-csv-files)",
-            result_text.split("\n")[2],
-            "CSV position must not contain the Parquet translation",
-        )
-
-        # Parquet line (URL changed) should be sent for AI translation
-        parquet_lines = [line for _, line in to_translate if "Parquet" in line]
-        self.assertEqual(
-            len(parquet_lines), 1,
-            f"Expected exactly one Parquet line in to_translate: {to_translate}",
-        )
-
-        # Unchanged label should be reused
+        self.assertIsNone(planned[2])
+        self.assertIsNone(planned[4])
+        self.assertEqual([slot for slot, _ in to_translate], [2, 4])
         self.assertIn("迁移", result_text)
 
 
@@ -693,8 +648,9 @@ class TestProcessIndexFileBySourceSnapshot(unittest.TestCase):
                 target_path,
             )
 
-            # Should still write (falling back to source lines) but report failure
+            # Failed translations must not create a partial target file
             self.assertFalse(success)
+            self.assertFalse(Path(target_path).exists())
 
 
 class TestTranslateIndexLines(unittest.TestCase):
@@ -913,5 +869,434 @@ class TestRemoveIncrementalWorkIncludesIndexFiles(unittest.TestCase):
         # Should not raise — index_files defaults to None
 
 
-if __name__ == "__main__":
+
+class FieldAIClient:
+    def __init__(self, response):
+        self.response = response
+        self.prompt = None
+
+    def chat_completion(self, messages, temperature=0.1):
+        self.prompt = messages[0]["content"]
+        return json.dumps(self.response)
+
+
+class TestIndexLanguageIndependentSync(unittest.TestCase):
+    def test_real_lake_snapshot_requires_no_ai(self):
+        fixtures = Path(__file__).parent / "fixtures" / "index_lake"
+        base, head, target = [(fixtures / name).read_text() for name in
+                              ("source_base.md", "source_head.md", "target_ja.md")]
+        base, head = [localize_docs_absolute_links(text, "Japanese")
+                      for text in (base, head)]
+        planned, queue = plan_synced_index_lines(base, head, target)
+        self.assertEqual(queue, [])
+        expected = target.replace(
+            "[コストの管理](https://docs.pingcap.com/ja/tidbcloudlake/manage-costs/)\n\n", ""
+        ).replace(
+            "[AI を活用した機能](https://docs.pingcap.com/ja/tidbcloudlake/ai-powered-features/)\n\n", ""
+        )
+        self.assertEqual("\n".join(planned), expected)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "_index.md"
+            path.write_text(target)
+            success = process_index_file_by_source_snapshot(
+                "_index.md", {"source_base_content": base, "source_head_content": head},
+                EmptyAIClient(), {"source_language": "English", "target_language": "Japanese"}, str(path)
+            )
+            self.assertTrue(success)
+            self.assertEqual(path.read_text(), expected)
+
+    def test_alphabets_do_not_affect_component_matching(self):
+        base = '<LearningPath label="Learn" icon="learn">\n[Guide](/guide)\n</LearningPath>'
+        for label in ("ロード", "배우기", "تعلم", "Учиться", "เรียน", "123"):
+            with self.subTest(label=label):
+                target = base.replace('label="Learn"', f'label="{label}"').replace("[Guide]", "[译文]")
+                self.assertTrue(_needs_translation(parse_index_line(target.splitlines()[0])))
+                planned, queue = plan_synced_index_lines(base, base, target)
+                self.assertEqual(queue, [])
+                self.assertEqual("\n".join(planned), target)
+
+    def test_missing_and_reordered_links_do_not_shift_translations(self):
+        base = '<LearningPath label="Learn" icon="learn">\n[A](/a)\n[B](/b)\n[C](/c)\n</LearningPath>'
+        target = '<LearningPath label="学习" icon="learn">\n[丙](/c)\n[甲](/a)\n</LearningPath>'
+        planned, queue = plan_synced_index_lines(base, base, target)
+        self.assertEqual(planned[1], "[甲](/a)")
+        self.assertEqual(planned[3], "[丙](/c)")
+        self.assertEqual(queue, [(2, "[B](/b)")])
+
+    def test_reordered_components_with_duplicate_icons(self):
+        one = '<LearningPath label="One" icon="same">\n[A](/a)\n</LearningPath>'
+        two = '<LearningPath label="Two" icon="same">\n[B](/b)\n</LearningPath>'
+        target = two.replace('"Two"', '"二"').replace("[B]", "[乙]") + "\n" + one.replace('"One"', '"一"').replace("[A]", "[甲]")
+        planned, queue = plan_synced_index_lines(one + "\n" + two, one + "\n" + two, target)
+        self.assertEqual(queue, [])
+        self.assertEqual(planned[0], '<LearningPath label="一" icon="same">')
+        self.assertEqual(planned[1], '[甲](/a)')
+        self.assertEqual(planned[3], '<LearningPath label="二" icon="same">')
+
+    def test_ambiguous_components_do_not_reuse_labels(self):
+        base = '<LearningPath label="One" icon="same">\n</LearningPath>\n<LearningPath label="Two" icon="same">\n</LearningPath>'
+        target = base.replace('"One"', '"一"').replace('"Two"', '"二"')
+        planned, queue = plan_synced_index_lines(base, base, target)
+        self.assertEqual([slot for slot, _ in queue], [0, 2])
+
+    def test_changed_source_text_requires_translation(self):
+        planned, queue = plan_synced_index_lines('[Old](/a)', '[New](/a)', '[旧](/a)')
+        self.assertEqual(queue, [(0, '[New](/a)')])
+
+    def test_source_controls_nontranslated_attributes(self):
+        base = '<LearningPath label="Learn" icon="old">\n[A](/a)\n</LearningPath>'
+        head = base.replace('icon="old"', 'icon="new"')
+        target = base.replace('"Learn"', '"学习"').replace('icon="old"', 'icon="stale"')
+        planned, queue = plan_synced_index_lines(base, head, target)
+        self.assertEqual(queue, [])
+        self.assertEqual(planned[0], '<LearningPath label="学习" icon="new">')
+
+    def test_explicit_locale_with_known_prefixes(self):
+        content = '[Guide](https://docs.pingcap.com/ja/guide#part)\n[Other](https://docs.pingcap.com/fr/guide)\n[External](https://example.com/ja/guide)'
+        localized = localize_docs_absolute_links(content, 'Korean', target_locale='ko', known_locales=('fr',))
+        self.assertIn('https://docs.pingcap.com/ko/guide#part', localized)
+        self.assertNotIn('/ko/ja/', localized)
+        self.assertNotIn('/ko/fr/', localized)
+        self.assertIn('https://example.com/ja/guide', localized)
+        self.assertEqual(localize_docs_absolute_links(localized, 'Korean', 'ko'), localized)
+
+    def test_process_explicit_locale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / '_index.md'
+            path.write_text('[안내](https://docs.pingcap.com/ko/guide)')
+            source = '[Guide](https://docs.pingcap.com/guide)'
+            success = process_index_file_by_source_snapshot(
+                '_index.md', {'source_base_content': source, 'source_head_content': source},
+                EmptyAIClient(), {'source_language': 'English', 'target_language': 'Korean', 'target_locale': 'ko'}, str(path)
+            )
+            self.assertTrue(success)
+            self.assertEqual(path.read_text(), '[안내](https://docs.pingcap.com/ko/guide)')
+
+    def test_ai_receives_only_fields_and_quotes_are_escaped(self):
+        client = FieldAIClient({'line_0': {'label': '「学ぶ」 "入門" & ガイド'}})
+        line = '<LearningPath label="Learn" icon="safe">'
+        result = translate_index_lines([(0, line)], client, {'source_language': 'English', 'target_language': 'Japanese'})
+        self.assertNotIn('<LearningPath', client.prompt)
+        self.assertNotIn('icon=', client.prompt)
+        self.assertEqual(result[0], '<LearningPath label="「学ぶ」 &quot;入門&quot; &amp; ガイド" icon="safe">')
+
+    def test_ai_cannot_supply_url_or_markdown_structure(self):
+        client = FieldAIClient({'line_0': {'display_text': 'Guide [A]'}})
+        result = translate_index_lines([(0, '  [Guide](https://example.com/a)  ')], client,
+                                       {'source_language': 'English', 'target_language': 'Japanese'})
+        self.assertNotIn('https://example.com', client.prompt)
+        self.assertEqual(result[0], '  [Guide &#91;A&#93;](https://example.com/a)  ')
+
+    def test_invalid_ai_preserves_existing_file(self):
+        responses = ({}, {'line_0': 'whole line'}, {'line_0': {'display_text': 123}},
+                     {'line_0': {'display_text': ''}}, {'line_0': {'display_text': 'a\nb'}},
+                     {'line_0': {'display_text': 'text', 'url': '/evil'}})
+        for response in responses:
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / '_index.md'
+                path.write_text('[旧](/a)')
+                success = process_index_file_by_source_snapshot(
+                    '_index.md', {'source_base_content': '[Old](/a)', 'source_head_content': '[New](/a)'},
+                    FieldAIClient(response), {'source_language': 'English', 'target_language': 'Japanese'}, str(path)
+                )
+                self.assertFalse(success)
+                self.assertEqual(path.read_text(), '[旧](/a)')
+
+    def test_unbalanced_source_components_are_not_written(self):
+        source = '<LearningPath label="Learn" icon="x">\n[A](/a)'
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / '_index.md'
+            path.write_text(source)
+            success = process_index_file_by_source_snapshot(
+                '_index.md', {'source_base_content': source, 'source_head_content': source}, EmptyAIClient(),
+                {'source_language': 'English', 'target_language': 'Japanese'}, str(path)
+            )
+            self.assertFalse(success)
+            self.assertEqual(path.read_text(), source)
+
+    def test_commit_cursor_does_not_break_frontmatter_reuse(self):
+        base = '---\ntitle: Docs\n---\n[Guide](/a)'
+        target = '<!--Corresponding EN commit: 49ed15df968aedb44b0290df53e124ef740c6a67-->\n---\ntitle: ドキュメント\n---\n[ガイド](/a)'
+        planned, queue = plan_synced_index_lines(base, base, target)
+        self.assertEqual(queue, [])
+        self.assertEqual(planned[1], 'title: ドキュメント')
+
+    def test_data_attributes_are_not_translated(self):
+        client = FieldAIClient({'line_0': {'label': '学ぶ'}})
+        line = '<LearningPath label="Learn" data-label="identifier" icon="x">'
+        result = translate_index_lines([(0, line)], client, {'source_language': 'English', 'target_language': 'Japanese'})
+        self.assertEqual(result[0], '<LearningPath label="学ぶ" data-label="identifier" icon="x">')
+
+    def test_external_host_and_unknown_paths_are_preserved(self):
+        content = '[A](https://docs.pingcap.com.evil/ja/a)\n[B](https://docs.pingcap.com/developer/a)'
+        result = localize_docs_absolute_links(content, 'Korean', 'ko')
+        self.assertIn('https://docs.pingcap.com.evil/ja/a', result)
+        self.assertIn('https://docs.pingcap.com/ko/developer/a', result)
+
+    def test_same_url_in_distinct_components_is_unambiguous(self):
+        base = '<LearningPath label="One" icon="one">\n[A](/a)\n</LearningPath>\n<LearningPath label="Two" icon="two">\n[B](/a)\n</LearningPath>'
+        target = base.replace('"One"', '"一"').replace('"Two"', '"二"').replace('[A]', '[甲]').replace('[B]', '[乙]')
+        planned, queue = plan_synced_index_lines(base, base, target)
+        self.assertEqual(queue, [])
+        self.assertEqual(planned[1], '[甲](/a)')
+        self.assertEqual(planned[4], '[乙](/a)')
+
+
+class TestIndexReviewRegressions(unittest.TestCase):
+    def test_existing_entities_and_markdown_are_preserved_verbatim(self):
+        base = '<LearningPath label="Learn" icon="a">\n[A](/a)\n</LearningPath>'
+        target = '<LearningPath label="学ぶ &copy; &#34;引用&#34;" icon="a">\n[A &copy; **bold** `code` \\[x\\]](/a)\n</LearningPath>'
+        planned, queue = plan_synced_index_lines(base, base, target)
+        self.assertEqual(queue, [])
+        self.assertEqual('\n'.join(planned), target)
+
+    def test_links_with_nested_or_escaped_delimiters_are_translatable(self):
+        for source in ('[Guide [A]](/a)', r'[Guide \[A\]](/a)',
+                       '[Guide `]` A](/a)', '[Guide ``code ``` ] inside`` end](/a)',
+                       '[Guide](/a(b))'):
+            with self.subTest(source=source):
+                entry = parse_index_line(source)
+                self.assertEqual(entry['type'], 'link')
+                planned, queue = plan_synced_index_lines(source, source, '')
+                self.assertEqual(queue, [(0, source)])
+                client = FieldAIClient({'line_0': {'display_text': '指南'}})
+                result = translate_index_lines(queue, client, {
+                    'source_language': 'English', 'target_language': 'Chinese'
+                })
+                self.assertEqual(parse_index_line(result[0])['url'], entry['url'])
+                self.assertEqual(parse_index_line(result[0])['display_text'], '指南')
+
+    def test_multiple_containers_use_descendant_links_for_matching(self):
+        one = '<LearningPathContainer platform="cloud" title="One">\n<LearningPath label="Learn" icon="same">\n[A](/a)\n</LearningPath>\n</LearningPathContainer>'
+        two = one.replace('title="One"', 'title="Two"').replace('[A](/a)', '[B](/b)')
+        target_one = one.replace('title="One"', 'title="一"').replace('label="Learn"', 'label="学ぶ"').replace('[A]', '[甲]')
+        target_two = two.replace('title="Two"', 'title="二"').replace('label="Learn"', 'label="学習"').replace('[B]', '[乙]')
+        base = one + '\n' + two
+        planned, queue = plan_synced_index_lines(base, base, target_two + '\n' + target_one)
+        self.assertEqual(queue, [])
+        self.assertEqual('\n'.join(planned), target_one + '\n' + target_two)
+
+    def test_repeated_icons_and_urls_stay_with_their_parent_container(self):
+        one = '<LearningPathContainer platform="one" title="One">\n<LearningPath label="Learn" icon="same">\n[A](/a)\n</LearningPath>\n</LearningPathContainer>'
+        two = one.replace('platform="one"', 'platform="two"').replace('title="One"', 'title="Two"')
+        target_one = one.replace('title="One"', 'title="一"').replace('label="Learn"', 'label="一の学習"').replace('[A]', '[第一产品]')
+        target_two = two.replace('title="Two"', 'title="二"').replace('label="Learn"', 'label="二の学習"').replace('[A]', '[第二产品]')
+        planned, queue = plan_synced_index_lines(one + '\n' + two, one, target_two + '\n' + target_one)
+        self.assertEqual(queue, [])
+        self.assertEqual('\n'.join(planned), target_one)
+
+    def test_conflicting_container_identity_is_not_reused(self):
+        source = '<LearningPathContainer platform="one" title="One">\n[A](/a)\n</LearningPathContainer>'
+        target = source.replace('platform="one"', 'platform="two"').replace('title="One"', 'title="第二产品"').replace('[A]', '[第二产品文档]')
+        planned, queue = plan_synced_index_lines(source, source, target)
+        self.assertEqual([slot for slot, _ in queue], [0, 1])
+
+    def test_url_overlap_does_not_override_unique_component_attributes(self):
+        source = '<LearningPath label="One" icon="one">\n[A](/a)\n[B](/b)\n</LearningPath>\n<LearningPath label="Two" icon="two">\n[C](/c)\n</LearningPath>'
+        target = '<LearningPath label="一" icon="one">\n[X](/x)\n</LearningPath>\n<LearningPath label="二" icon="two">\n[甲](/a)\n[乙](/b)\n[丙](/c)\n</LearningPath>'
+        planned, queue = plan_synced_index_lines(source, source, target)
+        self.assertEqual(planned[0], '<LearningPath label="一" icon="one">')
+        self.assertEqual(planned[4], '<LearningPath label="二" icon="two">')
+        self.assertEqual(planned[5], '[丙](/c)')
+        self.assertEqual([slot for slot, _ in queue], [1, 2])
+
+    def test_comparison_text_is_escaped_instead_of_rejected(self):
+        client = FieldAIClient({'line_0': {'display_text': '条件 x < 3 > 1'}})
+        result = translate_index_lines([(0, '[Conditions](/a)')], client, {
+            'source_language': 'English', 'target_language': 'Japanese'
+        })
+        self.assertEqual(result[0], '[条件 x &lt; 3 &gt; 1](/a)')
+
+
+class TestIndexReviewFeedback(unittest.TestCase):
+    def test_empty_and_inherited_locale_preserve_chinese_japanese_defaults(self):
+        for language, locale in (('Chinese', 'zh'), ('Japanese', 'ja')):
+            for inherited in ('', '  ', 'ko', 'k o'):
+                for explicit in (None, '', '  '):
+                    with self.subTest(language=language, inherited=inherited, explicit=explicit):
+                        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {'TARGET_LOCALE': inherited}):
+                            path = Path(tmpdir) / '_index.md'
+                            target = f'[指南](https://docs.pingcap.com/{locale}/tidb/stable/x)'
+                            path.write_text(target)
+                            source = '[Guide](https://docs.pingcap.com/tidb/stable/x)'
+                            config = {'source_language': 'English', 'target_language': language, 'target_locale': explicit}
+                            self.assertTrue(process_index_file_by_source_snapshot(
+                                '_index.md', {'source_base_content': source, 'source_head_content': source},
+                                EmptyAIClient(), config, str(path)
+                            ))
+                            self.assertEqual(path.read_text(), target)
+
+    def test_explicit_locale_overrides_environment_and_defaults(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {'TARGET_LOCALE': 'ko'}):
+            path = Path(tmpdir) / '_index.md'
+            source = '[Guide](https://docs.pingcap.com/guide)'
+            target = '[指南](https://docs.pingcap.com/zh-Hans/guide)'
+            path.write_text(target)
+            self.assertTrue(process_index_file_by_source_snapshot(
+                '_index.md', {'source_base_content': source, 'source_head_content': source}, EmptyAIClient(),
+                {'source_language': 'English', 'target_language': 'Chinese', 'target_locale': 'zh-Hans'}, str(path)
+            ))
+            self.assertEqual(path.read_text(), target)
+
+    def test_custom_language_reads_environment_locale(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {'TARGET_LOCALE': 'ko'}):
+            path = Path(tmpdir) / '_index.md'
+            source = '[Guide](https://docs.pingcap.com/guide)'
+            target = '[안내](https://docs.pingcap.com/ko/guide)'
+            path.write_text(target)
+            self.assertTrue(process_index_file_by_source_snapshot(
+                '_index.md', {'source_base_content': source, 'source_head_content': source}, EmptyAIClient(),
+                {'source_language': 'English', 'target_language': 'Korean'}, str(path)
+            ))
+            self.assertEqual(path.read_text(), target)
+
+    def test_invalid_locale_is_explicit_and_does_not_write(self):
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {'TARGET_LOCALE': 'k o'}):
+            path = Path(tmpdir) / '_index.md'
+            path.write_text('[안내](/a)')
+            log = io.StringIO()
+            with redirect_stdout(log):
+                success = process_index_file_by_source_snapshot(
+                    '_index.md', {'source_base_content': '[Guide](/a)', 'source_head_content': '[Guide](/a)'},
+                    EmptyAIClient(), {'source_language': 'English', 'target_language': 'Korean'}, str(path)
+                )
+            self.assertFalse(success)
+            self.assertIn('Invalid Index locale configuration for _index.md', log.getvalue())
+            self.assertEqual(path.read_text(), '[안내](/a)')
+
+    def test_code_spans_and_markdown_escapes_render_correctly(self):
+        cases = (
+            ('`<name>` 指南', '<name>'),
+            ('`List<T>` 指南', 'List<T>'),
+            ('`<&amp;>` 指南', '<&amp;>'),
+            ('`` `<name>` & `` 指南', '`<name>` &'),
+            (r'\[名称\] 指南', '[名称]'),
+            ('List<T> 指南', 'List<T>'),
+            ('<LearningPath> 指南', '<LearningPath>'),
+        )
+        for translation, expected in cases:
+            with self.subTest(translation=translation):
+                client = FieldAIClient({'line_0': {'display_text': translation}})
+                result = translate_index_lines([(0, '[Guide](/a)')], client, {
+                    'source_language': 'English', 'target_language': 'Chinese'
+                })
+                tokens = MarkdownIt().parseInline(result[0])[0].children
+                self.assertEqual(sum(token.type == 'link_open' for token in tokens), 1)
+                self.assertEqual(next(token.attrs['href'] for token in tokens if token.type == 'link_open'), '/a')
+                rendered = ''.join(token.content for token in tokens if token.type in ('text', 'code_inline'))
+                self.assertIn(expected, rendered)
+
+    def test_prompt_does_not_decode_entities_inside_code(self):
+        source = '[`&amp;` &amp; guide](/a)'
+        client = FieldAIClient({'line_0': {'display_text': '`&amp;` & 指南'}})
+        result = translate_index_lines([(0, source)], client, {
+            'source_language': 'English', 'target_language': 'Chinese'
+        })
+        request = json.JSONDecoder().raw_decode(client.prompt.split('Input lines to translate:\n', 1)[1])[0]
+        self.assertEqual(request['line_0']['display_text'], '`&amp;` & guide')
+        tokens = MarkdownIt().parseInline(result[0])[0].children
+        self.assertEqual(next(token.content for token in tokens if token.type == 'code_inline'), '&amp;')
+
+    def test_multiline_component_attributes_are_translated(self):
+        source = '<LearningPath\n  label="Learn"\n  icon="cloud1"\n>\n\n[Guide](/a)\n\n</LearningPath>'
+        client = FieldAIClient({'line_0': {'label': '学ぶ'}, 'line_1': {'display_text': 'ガイド'}})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / '_index.md'
+            self.assertTrue(process_index_file_by_source_snapshot(
+                '_index.md', {'source_base_content': '', 'source_head_content': source}, client,
+                {'source_language': 'English', 'target_language': 'Japanese'}, str(path)
+            ))
+            self.assertEqual(path.read_text(), source.replace('label="Learn"', 'label="学ぶ"').replace('[Guide]', '[ガイド]'))
+
+    def test_multiline_existing_translation_is_reused(self):
+        source = '<LearningPath\n label="Learn"\n icon="cloud1"\n>\n[A](/a)\n</LearningPath>'
+        target = source.replace('label="Learn"', 'label="ロード"').replace('[A]', '[甲]')
+        planned, queue = plan_synced_index_lines(source, source.replace('icon="cloud1"', 'icon="new"'), target)
+        self.assertEqual(queue, [])
+        self.assertEqual('\n'.join(planned), target.replace('icon="cloud1"', 'icon="new"'))
+
+    def test_nested_and_self_closing_components_preserve_source_structure(self):
+        sources = (
+            '<LearningPathContainer title="One">\n<LearningPathContainer title="Two">\n[A](/a)\n</LearningPathContainer>\n</LearningPathContainer>',
+            '<LearningPath label="Learn" icon="x" />',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / '_index.md'
+                path.write_text(source)
+                self.assertTrue(process_index_file_by_source_snapshot(
+                    '_index.md', {'source_base_content': source, 'source_head_content': source}, EmptyAIClient(),
+                    {'source_language': 'English', 'target_language': 'Japanese'}, str(path)
+                ))
+                self.assertEqual(path.read_text(), source)
+
+    def test_extra_response_keys_do_not_discard_valid_requested_fields(self):
+        client = FieldAIClient({'line_0': {'display_text': '甲'}, 'unexpected': {'url': '/evil'}})
+        result = translate_index_lines([(0, '[A](/a)')], client, {
+            'source_language': 'English', 'target_language': 'Chinese'
+        })
+        self.assertEqual(result, {0: '[甲](/a)'})
+
+    def test_missing_response_keys_retain_valid_mappings_and_report_failure(self):
+        client = FieldAIClient({'line_0': {'display_text': '甲'}})
+        log = io.StringIO()
+        with redirect_stdout(log):
+            result = translate_index_lines([(0, '[A](/a)'), (1, '[B](/b)')], client, {
+                'source_language': 'English', 'target_language': 'Chinese'
+            })
+        self.assertEqual(result, {0: '[甲](/a)'})
+        self.assertIn('1/2', log.getvalue())
+        self.assertNotIn('Successfully translated', log.getvalue())
+
+    def test_zero_valid_fields_log_is_not_success(self):
+        log = io.StringIO()
+        with redirect_stdout(log):
+            translate_index_lines([(0, '[A](/a)')], FieldAIClient({}), {
+                'source_language': 'English', 'target_language': 'Chinese'
+            })
+        self.assertNotIn('Successfully translated', log.getvalue())
+        self.assertIn('0/1', log.getvalue())
+
+    def test_nested_entity_encoding_is_decoded_only_once(self):
+        source = '[&amp;copy; guide](/a)'
+        client = FieldAIClient({'line_0': {'display_text': '&copy; 指南'}})
+        result = translate_index_lines([(0, source)], client, {
+            'source_language': 'English', 'target_language': 'Chinese'
+        })
+        tokens = MarkdownIt().parseInline(result[0])[0].children
+        self.assertIn('&copy;', ''.join(token.content for token in tokens))
+        self.assertNotIn('©', result[0])
+
+    def test_multiline_scanner_leaves_frontmatter_block_scalars_untouched(self):
+        source = '---\nsummary: |\n  <LearningPath sample text\n---\n[Guide](/a)'
+        target = source.replace('[Guide]', '[指南]')
+        planned, queue = plan_synced_index_lines(source, source, target)
+        self.assertEqual(queue, [])
+        self.assertEqual('\n'.join(planned), target)
+
+    def test_many_ambiguous_icons_are_disambiguated_by_link_overlap(self):
+        source, target = [], []
+        for index in range(40):
+            source.append(f'<LearningPath label="Learn {index}" icon="same">\n[Common](/common)\n[A](/a{index})\n</LearningPath>')
+            target.append(f'<LearningPath label="学ぶ {index}" icon="same">\n[共通](/common)\n[甲{index}](/a{index})\n</LearningPath>')
+        planned, queue = plan_synced_index_lines('\n'.join(source), '\n'.join(source), '\n'.join(reversed(target)))
+        self.assertEqual(queue, [])
+        self.assertEqual('\n'.join(planned), '\n'.join(target))
+
+    def test_unterminated_multiline_tag_is_explicit_failure(self):
+        log = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / '_index.md'
+            path.write_text('[既存](/a)')
+            with redirect_stdout(log):
+                success = process_index_file_by_source_snapshot(
+                    '_index.md', {'source_base_content': '', 'source_head_content': '<LearningPath\n label="Learn"'},
+                    EmptyAIClient(), {'source_language': 'English', 'target_language': 'Japanese'}, str(path)
+                )
+            self.assertFalse(success)
+            self.assertEqual(path.read_text(), '[既存](/a)')
+            self.assertIn('Unterminated LearningPath opening tag', log.getvalue())
+
+
+if __name__ == '__main__':
     unittest.main()

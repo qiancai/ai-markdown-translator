@@ -2867,5 +2867,83 @@ class CommitSyncLinkFinalizerTest(unittest.TestCase):
             self.assertIn("[连接](other.md#connect)", guide.read_text(encoding="utf-8"))
 
 
-if __name__ == "__main__":
+class IndexCursorFeedbackIntegrationTest(unittest.TestCase):
+    def run_index_group(self, tmpdir, response):
+        class IndexAI:
+            def chat_completion(self, messages, temperature=0.1):
+                return json.dumps(response)
+
+        source_base = '[Old](/a)'
+        source_head = '[New](/a)\n[B](/b)'
+        index_data = {'type': 'index', 'source_base_content': source_base, 'source_head_content': source_head}
+        changed_file = SimpleNamespace(filename='_index.md', status='modified', patch='@@ -1 +1,2 @@\n-[Old](/a)\n+[New](/a)\n+[B](/b)\n')
+        stats = workflow.TranslationStats()
+        with mock.patch.object(workflow, 'TARGET_REPO_PATH', tmpdir), mock.patch.object(
+            workflow, 'analyze_source_changes', return_value=(
+                {}, {}, {}, {}, [], {}, {}, [], [], [], set(), {'_index.md': index_data}, {}
+            )
+        ), mock.patch.object(workflow, 'git_add_successful_task_changes'), mock.patch.object(
+            workflow, 'get_source_ref_content', return_value=source_head
+        ):
+            result = workflow.process_translation_group(
+                'index retry', source_files_translation_mode='incremental', source_files='_index.md',
+                source_folder='', diff_context={'mode': 'commit', 'base_ref': '1111111', 'head_ref': '2222222'},
+                filtered_changed_files=[changed_file], pr_diff=changed_file.patch,
+                github_client=object(), ai_client=IndexAI(), repo_config={
+                    'source_language': 'English', 'target_language': 'Japanese', 'target_local_path': tmpdir
+                }, repo_configs={}, glossary_matcher=None, commit_ignore_files=[], translation_stats=stats
+            )
+        return result, stats
+
+    def test_incomplete_index_preserves_marker_and_pending_range_then_retries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / '_index.md'
+            original = '<!--Corresponding EN commit: 1111111-->\n[旧](/a)'
+            path.write_text(original)
+            result, stats = self.run_index_group(tmpdir, {'line_0': {'display_text': '新'}})
+            self.assertEqual(result['successful_file_paths'], set())
+            self.assertEqual(path.read_text(), original)
+            self.assertEqual(stats.retry_refs, {'_index.md': '1111111'})
+            self.assertTrue(workflow.update_retry_cursor_ledger(
+                tmpdir, stats, set(), source_branch='release-8.5', source_head_ref='2222222'
+            ))
+            groups, paths = workflow.load_retry_cursor_groups(tmpdir)
+            self.assertEqual(groups, {'1111111': {'_index.md'}})
+            self.assertEqual(paths, {'_index.md'})
+            self.assertEqual(stats.failed[0][0], '_index.md')
+
+            result, retry_stats = self.run_index_group(tmpdir, {
+                'line_0': {'display_text': '新'}, 'line_1': {'display_text': '乙'}
+            })
+            self.assertEqual(result['successful_file_paths'], {'_index.md'})
+            self.assertEqual(retry_stats.failed, [])
+            self.assertEqual(retry_stats.structure_errors, [])
+            workflow.update_corresponding_en_commit_for_files(
+                result['successful_file_paths'], tmpdir, '2222222', add_if_missing=False, remove_if_present=True
+            )
+            self.assertEqual(path.read_text(), '[新](/a)\n[乙](/b)')
+            self.assertTrue(workflow.update_retry_cursor_ledger(
+                tmpdir, retry_stats, result['successful_file_paths'],
+                source_branch='release-8.5', source_head_ref='2222222'
+            ))
+            self.assertEqual(workflow.load_retry_cursor_groups(tmpdir), ({}, set()))
+
+    def test_successful_manual_index_updates_commit_marker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / '_index.md'
+            path.write_text('<!--Corresponding EN commit: 1111111-->\n[旧](/a)')
+            result, stats = self.run_index_group(tmpdir, {
+                'line_0': {'display_text': '新'}, 'line_1': {'display_text': '乙'}
+            })
+            self.assertEqual(stats.failed, [])
+            updated, failures = workflow.update_corresponding_en_commit_for_files(
+                result['successful_file_paths'], tmpdir, '2222222', add_if_missing=True
+            )
+            self.assertEqual(updated, ['_index.md'])
+            self.assertEqual(failures, {})
+            self.assertEqual(path.read_text().count('Corresponding EN commit:'), 1)
+            self.assertIn('Corresponding EN commit: 2222222', path.read_text())
+
+
+if __name__ == '__main__':
     unittest.main()

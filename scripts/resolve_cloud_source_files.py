@@ -231,9 +231,17 @@ def resolve_source_files(
     input_file_names="",
     changed_rows=None,
     always_include_files=None,
+    *,
+    toc_scope_added_files=None,
 ):
+    """Resolve scoped files, accepting the legacy TOC-added keyword.
+
+    Older local entry points pass ``toc_scope_added_files``. Treat it as an
+    alias for ``always_include_files`` and combine both when supplied.
+    Explicit file requests still restrict the returned translation scope.
+    """
     normalized_always_include_files = set()
-    for item in always_include_files or []:
+    for item in list(always_include_files or []) + list(toc_scope_added_files or []):
         rel = normalize_doc_path(item)
         if rel:
             normalized_always_include_files.add(rel)
