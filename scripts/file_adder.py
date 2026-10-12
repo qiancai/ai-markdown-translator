@@ -307,6 +307,7 @@ STRICT STRUCTURE RULES:
 1. Return exactly one complete Markdown table and nothing else.
 2. Preserve every pipe delimiter, the exact separator row, indentation, row count, and column count.
 3. Preserve code spans, SQL, commands, URLs, file paths, placeholders, product names, API names, identifiers, parameter names, numbers, and symbols exactly.
+   Preserve the Markdown admonition labels **Note:**, **Tip:**, and **Warning:** exactly, including capitalization, colons, and bold syntax. Translate the natural-language text following these labels normally.
 4. When a column headed "Parameter", "Field", "Setting", "Option", or a similar label contains parameter names, configuration names, or UI field names, preserve those body-cell names exactly as written in the source, even if they contain spaces or lowercase words. Also preserve exact UI action names, status labels, mode names, and option/default values. Translate the column header and descriptive cells normally.
 5. Do not treat the table as a code block. Translate natural-language descriptions even when they appear next to protected technical text.
 6. Do not add explanations or wrap the table in a code fence.
@@ -517,6 +518,7 @@ IMPORTANT INSTRUCTIONS:
         - In some scenarios, if keeping certain words in {source_language} is much better and common than translating them to {target_language}, keep them in {source_language} is OK. For example, "AWS access key" is better to keep in English.
     - For internal Markdown links such as [link text](/path/to/file.md#section-name), only translate the natural-language part in the link text to the {target_language}, and keep the linked file name and section name exactly the same as written in the source.
 2. Do NOT translate:
+   - Markdown admonition labels **Note:**, **Tip:**, and **Warning:**. Preserve their capitalization, colons, and bold syntax exactly; translate the natural-language text following these labels normally.
    - Code examples, SQL queries, configuration values, doc variables/placeholders such as {doc_variable_example}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
    - `<CustomContent ...>` and `</CustomContent>` tags. Preserve each tag, its attributes, and its placement exactly, while translating natural-language text inside inline `CustomContent` normally.
    - Explicit anchors such as {{#example-test}} in the section titles.
