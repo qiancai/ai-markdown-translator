@@ -6,7 +6,6 @@ Handles processing and translation of newly added files
 import os
 import re
 import json
-import threading
 from github import Github
 from openai import OpenAI
 from file_io import atomic_write_text
@@ -21,8 +20,7 @@ from workflow_outcome import FileOutcomes
 from product_specific_handler import get_product_name, rewrite_tidb_version_anchors_in_text
 from svg_preprocessor import strip_svgs, restore_svgs
 
-# Thread-safe printing
-print_lock = threading.Lock()
+from workflow_logging import thread_safe_print, verbose_thread_safe_print, log_context
 
 
 class TranslatedBatchText(str):
@@ -32,11 +30,6 @@ class TranslatedBatchText(str):
         obj = super().__new__(cls, value or "")
         obj.partial_reasons = list(partial_reasons or [])
         return obj
-
-def thread_safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
-
 
 def _find_markdown_section_starts(lines):
     """Return ATX heading positions, ignoring heading-like lines in code fences."""
@@ -439,23 +432,8 @@ def repair_suspected_untranslated_tables(
     return repaired_content, partial_reasons
 
 
-def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None, source_mode="", context_reference=None, prior_translation_reference=None):
-    """Translate a single batch of file content using AI.
-
-    ``context_reference`` is optional surrounding source text included in the
-    prompt as read-only context (not translated, not returned). It lets callers
-    translate a small fragment while still giving the model the full section for
-    accurate terminology and tone.
-
-    ``prior_translation_reference`` is the existing target-language translation of
-    the surrounding section. When provided, the model is told to keep its wording
-    for anything that did not change and only re-render what the source actually
-    changed -- i.e. a minimal edit rather than a fresh translation.
-    """
-    if not batch_content.strip():
-        return batch_content
-
-    thread_safe_print(f"   🤖 Translating batch ({len(batch_content.split())} words)...")
+def prepare_file_translation_request(batch_content, source_language="English", target_language="Chinese", glossary_matcher=None, source_mode="", context_reference=None, prior_translation_reference=None):
+    """Build the complete legacy prompt without sending a request."""
     prompt_batch_content = preprocess_added_file_batch_for_heading_anchor_stability(
         batch_content,
         source_language,
@@ -465,8 +443,6 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
 
     table_source_content = prompt_batch_content
     prompt_batch_content, svg_map = strip_svgs(prompt_batch_content)
-    if svg_map:
-        thread_safe_print(f"   🖼️  Replaced {len(svg_map)} SVG(s) with placeholders for AI translation")
 
     # Build glossary section for prompt if matcher is provided
     glossary_prompt_section = ""
@@ -482,7 +458,7 @@ def translate_file_batch(batch_content, ai_client, source_language="English", ta
             )
             glossary_prompt_section = f"\n{glossary_text}\n"
             glossary_instruction = "\n6. When translating terms listed in the glossary, use the provided translations for consistency."
-            thread_safe_print(f"   📚 Matched {len(matched_terms)} glossary terms for batch translation")
+
 
     doc_variable_example = "{{{ .starter }}}"
     product_name = get_product_name()
@@ -516,7 +492,7 @@ IMPORTANT INSTRUCTIONS:
         - Preserve every pipe delimiter, separator row, indentation, row count, and column count. Keep code spans, identifiers, parameter names, product names, API names, numbers, and symbols unchanged.
         - In columns headed "Parameter", "Field", "Setting", "Option", or similar, preserve body-cell parameter names, configuration names, and UI field names exactly as written in the source, even when they contain spaces or lowercase words. Also preserve exact UI action names, status labels, mode names, and option/default values. Translate the column header and descriptions normally.
         - In some scenarios, if keeping certain words in {source_language} is much better and common than translating them to {target_language}, keep them in {source_language} is OK. For example, "AWS access key" is better to keep in English.
-    - For internal Markdown links such as [link text](/path/to/file.md#section-name), only translate the natural-language part in the link text to the {target_language}, and keep the linked file name and section name exactly the same as written in the source.
+    - For internal Markdown links such as [link text](/path/to/file.md#section-name), only translate the natural-language part in the link text to the {target_language}, and keep the linked file name and section name exactly the same as written in the source. Exception: preserve link labels that are part of an exact UI name, as required below.
 2. Do NOT translate:
    - Markdown admonition labels **Note:**, **Tip:**, and **Warning:**. Preserve their capitalization, colons, and bold syntax exactly; translate the natural-language text following these labels normally.
    - Code examples, SQL queries, configuration values, doc variables/placeholders such as {doc_variable_example}, and Mermaid diagram code blocks (```mermaid ... ```). Preserve doc variables exactly as they appear, including triple braces and when they appear inside HTML attributes or tab labels.
@@ -525,6 +501,7 @@ IMPORTANT INSTRUCTIONS:
    - File paths, URLs, and command line examples
    - Variable names and system configuration parameters
    - Some text wrapped in ** (such as **Create Resource** on the **Project** page) are UI button or label names, keep them in English if the context of that paragraph indicates that it is UI text.
+   - Preserve an entire UI name, including any linked words inside it. This rule takes priority over translating link labels. For example, in "select the **Use [File naming conventions](/guide.md) for automatic mapping** option", preserve everything between the bold markers; translate only the surrounding prose.
 3. Translate only the descriptive text and explanations (for such content, you can rewrite it from {source_language} to {target_language} in a more natural and fluent way without changing its original meaning).
 
     - If the {target_language} is English, use title case for #-level titles and sentence case for titles at ## level or deeper. Otherwise, skip this rule.
@@ -542,6 +519,31 @@ Glossary for terms in {source_language} and {target_language}:
 {prompt_batch_content}
 """
 
+    return prompt, table_source_content, svg_map
+
+
+def translate_file_batch(batch_content, ai_client, source_language="English", target_language="Chinese", glossary_matcher=None, source_mode="", context_reference=None, prior_translation_reference=None):
+    """Translate a single batch of file content using AI.
+
+    ``context_reference`` is optional surrounding source text included in the
+    prompt as read-only context (not translated, not returned). It lets callers
+    translate a small fragment while still giving the model the full section for
+    accurate terminology and tone.
+
+    ``prior_translation_reference`` is the existing target-language translation of
+    the surrounding section. When provided, the model is told to keep its wording
+    for anything that did not change and only re-render what the source actually
+    changed -- i.e. a minimal edit rather than a fresh translation.
+    """
+    if not batch_content.strip():
+        return batch_content
+
+    verbose_thread_safe_print(f"   🤖 Translating batch ({len(batch_content.split())} words)...")
+    prompt, table_source_content, svg_map = prepare_file_translation_request(
+        batch_content, source_language, target_language, glossary_matcher,
+        source_mode, context_reference, prior_translation_reference,
+    )
+
     # Add token estimation
     try:
         from main import print_token_estimation
@@ -554,16 +556,18 @@ Glossary for terms in {source_language} and {target_language}:
             tokens = enc.encode(prompt)
             actual_tokens = len(tokens)
             char_count = len(prompt)
-            print(f"   💰 File addition translation")
-            print(f"      📝 Input: {char_count:,} characters")
-            print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+            thread_safe_print(
+                f"   💰 File addition translation | Input: {char_count:,} characters | "
+                f"Actual tokens: {actual_tokens:,} (tiktoken cl100k_base)"
+            )
         except Exception:
             # Final fallback to character approximation
             estimated_tokens = len(prompt) // 4
             char_count = len(prompt)
-            print(f"   💰 File addition translation")
-            print(f"      📝 Input: {char_count:,} characters")
-            print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
+            thread_safe_print(
+                f"   💰 File addition translation | Input: {char_count:,} characters | "
+                f"Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)"
+            )
     
     # Batch separators belong to the caller and are commonly omitted by the
     # model, then restored when translated blocks are reassembled. Exclude only
@@ -613,7 +617,7 @@ Glossary for terms in {source_language} and {target_language}:
             f"Translated batch has {translated_line_count} lines versus {source_line_count} source lines"
         )
 
-    thread_safe_print(f"   ✅ Batch translation completed")
+    verbose_thread_safe_print(f"   ✅ Batch translation completed")
     return TranslatedBatchText(translated_content, partial_reasons)
 
 def process_added_files(
@@ -638,7 +642,7 @@ def process_added_files(
             return FileOutcomes()
         return (True, {}) if return_details else True
     
-    thread_safe_print(f"\n📄 Processing {len(added_files)} newly added files...")
+    verbose_thread_safe_print(f"\n📄 Processing {len(added_files)} newly added files...")
     all_success = True
     failure_reasons = {}
     outcomes = FileOutcomes()
@@ -650,113 +654,115 @@ def process_added_files(
     source_mode = get_source_mode(source_context_or_pr_url)
     
     for file_path, file_content in added_files.items():
-        thread_safe_print(f"\n📝 Processing new file: {file_path}")
+        with log_context(file_path):
+            verbose_thread_safe_print(f"\n📝 Processing new file: {file_path}")
         
-        # Create target file path
-        try:
-            target_file_path = safe_target_path(target_local_path, file_path)
-        except ValueError as e:
-            reason = sanitize_exception_message(e)
-            thread_safe_print(f"   ❌ {reason}")
-            failure_reasons[file_path] = reason
-            all_success = False
-            outcomes.add(file_path, "failed", reason)
-            continue
-        target_dir = os.path.dirname(target_file_path)
-        
-        # Create directory if it doesn't exist
-        if not os.path.exists(target_dir):
+            # Create target file path
             try:
-                os.makedirs(target_dir, exist_ok=True)
-                thread_safe_print(f"   📁 Created directory: {target_dir}")
-            except Exception as e:
-                reason = (
-                    f"Error creating target directory {target_dir}: "
-                    f"{sanitize_exception_message(e)}"
-                )
+                target_file_path = safe_target_path(target_local_path, file_path)
+            except ValueError as e:
+                reason = sanitize_exception_message(e)
                 thread_safe_print(f"   ❌ {reason}")
                 failure_reasons[file_path] = reason
                 all_success = False
                 outcomes.add(file_path, "failed", reason)
                 continue
+            target_dir = os.path.dirname(target_file_path)
         
-        # Check if file already exists
-        target_file_exists = os.path.exists(target_file_path)
-        if target_file_exists:
-            if overwrite_existing:
-                thread_safe_print(f"   ♻️  Target file exists; overwriting: {target_file_path}")
-            else:
-                reason = f"Target file already exists: {target_file_path}"
-                thread_safe_print(f"   ⚠️  {reason}")
-                failure_reasons[file_path] = reason
-                all_success = False
-                outcomes.add(file_path, "failed", reason)
+            # Create directory if it doesn't exist
+            if not os.path.exists(target_dir):
+                try:
+                    os.makedirs(target_dir, exist_ok=True)
+                    thread_safe_print(f"   📁 Created directory: {target_dir}")
+                except Exception as e:
+                    reason = (
+                        f"Error creating target directory {target_dir}: "
+                        f"{sanitize_exception_message(e)}"
+                    )
+                    thread_safe_print(f"   ❌ {reason}")
+                    failure_reasons[file_path] = reason
+                    all_success = False
+                    outcomes.add(file_path, "failed", reason)
+                    continue
+
+            # Check if file already exists
+            target_file_exists = os.path.exists(target_file_path)
+            if target_file_exists:
+                if overwrite_existing:
+                    thread_safe_print(f"   ♻️  Target file exists; overwriting: {target_file_path}")
+                else:
+                    reason = f"Target file already exists: {target_file_path}"
+                    thread_safe_print(f"   ⚠️  {reason}")
+                    failure_reasons[file_path] = reason
+                    all_success = False
+                    outcomes.add(file_path, "failed", reason)
+                    continue
+
+            # Create section batches for translation
+            batches = create_section_batches(file_content, max_lines_per_batch=200)
+            verbose_thread_safe_print(f"   📦 Created {len(batches)} batches for translation")
+
+            # Translate each batch
+            translated_batches = []
+            file_partial_reasons = []
+            translation_failed = False
+            for i, batch in enumerate(batches):
+                verbose_thread_safe_print(f"🔄 Processing batch {i+1}/{len(batches)}")
+                try:
+                    with log_context(f"batch {i+1}/{len(batches)}"):
+                        translated_batch = translate_file_batch(
+                            batch,
+                            ai_client,
+                            source_language,
+                            target_language,
+                            glossary_matcher=glossary_matcher,
+                            source_mode=source_mode,
+                        )
+                except Exception as e:
+                    reason = f"Translation failed for {file_path} batch {i+1}: {sanitize_exception_message(e)}"
+                    thread_safe_print(f"   ❌ {reason}")
+                    failure_reasons[file_path] = reason
+                    all_success = False
+                    outcomes.add(file_path, "failed", reason)
+                    translation_failed = True
+                    break
+                translated_batches.append(translated_batch)
+                file_partial_reasons.extend(
+                    getattr(translated_batch, "partial_reasons", [])
+                )
+
+            if translation_failed:
                 continue
 
-        # Create section batches for translation
-        batches = create_section_batches(file_content, max_lines_per_batch=200)
-        thread_safe_print(f"   📦 Created {len(batches)} batches for translation")
-        
-        # Translate each batch
-        translated_batches = []
-        file_partial_reasons = []
-        translation_failed = False
-        for i, batch in enumerate(batches):
-            thread_safe_print(f"   🔄 Processing batch {i+1}/{len(batches)}")
+            # Combine translated batches while preserving source paragraph boundaries.
+            translated_content = _join_translated_batches(batches, translated_batches)
+            translated_content = ensure_blank_lines_before_headings(translated_content)
+
+            # Write translated content to target file
             try:
-                translated_batch = translate_file_batch(
-                    batch, 
-                    ai_client, 
-                    source_language, 
-                    target_language,
-                    glossary_matcher=glossary_matcher,
-                    source_mode=source_mode,
-                )
+                atomic_write_text(target_file_path, translated_content)
+
+                action = "Updated" if overwrite_existing and target_file_exists else "Created"
+                thread_safe_print(f"   ✅ {action} translated file: {target_file_path}")
+                if file_partial_reasons:
+                    outcomes.add(
+                        file_path,
+                        "partial",
+                        "; ".join(dict.fromkeys(file_partial_reasons)),
+                    )
+                else:
+                    outcomes.add(file_path, "success")
+
             except Exception as e:
-                reason = f"Translation failed for {file_path} batch {i+1}: {sanitize_exception_message(e)}"
-                thread_safe_print(f"   ❌ {reason}")
+                reason = f"Error creating file {target_file_path}: {sanitize_exception_message(e)}"
+                thread_safe_print(
+                    f"   ❌ {reason}"
+                )
                 failure_reasons[file_path] = reason
                 all_success = False
                 outcomes.add(file_path, "failed", reason)
-                translation_failed = True
-                break
-            translated_batches.append(translated_batch)
-            file_partial_reasons.extend(
-                getattr(translated_batch, "partial_reasons", [])
-            )
 
-        if translation_failed:
-            continue
-        
-        # Combine translated batches while preserving source paragraph boundaries.
-        translated_content = _join_translated_batches(batches, translated_batches)
-        translated_content = ensure_blank_lines_before_headings(translated_content)
-
-        # Write translated content to target file
-        try:
-            atomic_write_text(target_file_path, translated_content)
-            
-            action = "Updated" if overwrite_existing and target_file_exists else "Created"
-            thread_safe_print(f"   ✅ {action} translated file: {target_file_path}")
-            if file_partial_reasons:
-                outcomes.add(
-                    file_path,
-                    "partial",
-                    "; ".join(dict.fromkeys(file_partial_reasons)),
-                )
-            else:
-                outcomes.add(file_path, "success")
-            
-        except Exception as e:
-            reason = f"Error creating file {target_file_path}: {sanitize_exception_message(e)}"
-            thread_safe_print(
-                f"   ❌ {reason}"
-            )
-            failure_reasons[file_path] = reason
-            all_success = False
-            outcomes.add(file_path, "failed", reason)
-    
-    thread_safe_print(f"\n✅ Completed processing all new files")
+    verbose_thread_safe_print(f"\n✅ Completed processing all new files")
     if return_outcomes:
         return outcomes
     return (all_success, failure_reasons) if return_details else all_success

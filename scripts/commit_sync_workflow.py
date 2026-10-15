@@ -53,7 +53,8 @@ os.environ.setdefault(
     TIDB_CLOUD_ABSOLUTE_LINK_PREFIX,
 )
 
-from ai_client import UnifiedAIClient, thread_safe_print
+from ai_client import UnifiedAIClient
+from workflow_logging import configure_output, thread_safe_print
 from diff_analyzer import (
     build_commit_diff_context,
     build_local_commit_diff_context,
@@ -2005,6 +2006,7 @@ def process_translation_group(
 
 def main():
     """Run the commit-based translation workflow."""
+    configure_output()
     try:
         source_files_translation_mode = get_effective_source_files_translation_mode(
             SOURCE_FILES_TRANSLATION_MODE,

@@ -385,7 +385,15 @@ Customize handling for specific files and folders in `scripts/workflow_ignore_co
 }
 ```
 
-`VERBOSE_WORKFLOW_LOGS` currently defaults to `true`, which prints full mapping responses and detailed translation diagnostics. Set it to `false` in GitHub Actions when compact logs are preferred.
+`VERBOSE_WORKFLOW_LOGS` defaults to `false`. Compact logs show file paths, batch progress, request sizes, and completion counts per processing group (for example, added files). AI requests still waiting after 60 seconds emit a waiting message every 60 seconds. Progress logs are flushed immediately. Set `VERBOSE_WORKFLOW_LOGS=true` to include glossary matches, detailed diff analysis, full mapping responses, and translation diagnostics. Completion counts describe translation processing, not commits or pushes to GitHub.
+
+Upgrade note: `VERBOSE_WORKFLOW_LOGS` previously defaulted to `true`. Set it explicitly to `true` to retain the previous detailed diagnostic output after upgrading.
+
+### Fragment batching for restructured files
+
+The reconciler retains unchanged translations and collects changed fragments from the same file before requesting translation. It groups fragments into requests targeting at most 200 source lines, checks the complete prompt against a 50,000-token input budget, and estimates output size against the AI client's output-token limit. Shared section context and existing translations are included once per reference pair. Oversized runs split only between Markdown blocks; an indivisible block can exceed the line target if it still fits the token budgets. A fragment that cannot fit the token budgets is reported as a failure and the existing target file is preserved.
+
+Each fragment has a stable ID so responses can be reordered safely. Missing or invalid fragment results receive one focused retry; valid results are retained. Heading levels, CustomContent tags, SVG placeholders, code blocks, and tables are checked before the translated fragments are spliced into the existing document. A truncated response is treated as incomplete. Logs show both the fragment count and the number of request groups.
 
 ### Section matching strategies
 

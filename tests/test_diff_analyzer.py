@@ -2079,7 +2079,7 @@ class DiffAnalyzerContextTest(unittest.TestCase):
             patch=patch,
         )
 
-        with mock.patch.object(diff_analyzer, "thread_safe_print") as safe_print:
+        with mock.patch.object(diff_analyzer, "verbose_thread_safe_print") as safe_print:
             operations = analyze_diff_operations(
                 changed_file,
                 base_content=base_content,

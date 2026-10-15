@@ -18,11 +18,11 @@ The *reuse* unit and the *translation* unit are deliberately decoupled:
   leaves adjacent paragraphs, code blocks, and headings reused byte-for-byte.
   Unchanged code blocks are therefore never sent to the AI, which avoids the AI
   mangling them.
-* Translation is done per **run** of consecutive changed blocks, and the model
-  is given the whole **enclosing section** (heading-bounded) as read-only
-  context.  This restores section-level context for accurate terminology and
-  tone, while only the changed run is translated and spliced back; everything
-  else stays reused.
+* Translation fragments retain their individual splice boundaries, but fragments
+  from the same file are grouped into requests targeting at most 200 source
+  lines and bounded input/output tokens. Enclosing-section context and prior
+  translations are deduplicated per request. Results are matched by stable IDs;
+  only missing or invalid fragments are retried separately.
 
 Reuse keying
 ------------
@@ -40,8 +40,16 @@ import re
 from collections import defaultdict, deque
 from difflib import SequenceMatcher
 
-from ai_client import thread_safe_print
-from file_adder import translate_file_batch
+from workflow_logging import file_log_context, thread_safe_print
+from file_adder import (
+    translate_file_batch, preprocess_added_file_batch_for_heading_anchor_stability,
+    repair_suspected_untranslated_tables, prepare_file_translation_request,
+)
+from fragment_batch_translator import (
+    MAX_FRAGMENT_LINES, TranslationFragment, translate_fragments, render_fragments,
+)
+from svg_preprocessor import strip_svgs, restore_svgs
+from product_specific_handler import rewrite_tidb_version_anchors_in_text
 from translation_structure_validator import (
     HEADING_RE,
     compare_custom_content_structure,
@@ -568,6 +576,9 @@ def _translate_preserving_custom_content(content, *args, **kwargs):
         # Preserve the translation failure as-is. Reporting a placeholder
         # mutation here would hide the actual API/client failure from callers.
         return None
+    if getattr(translated, "partial_reasons", []):
+        thread_safe_print("❌ Reconciler: fragment translation is incomplete")
+        return None
     translated = _restore_markdown_indentation(protected, translated)
     if not tags:
         return translated
@@ -583,6 +594,112 @@ def _translate_preserving_custom_content(content, *args, **kwargs):
     for placeholder, tag in zip(placeholders, tags):
         restored = restored.replace(placeholder, tag, 1)
     return restored
+
+
+def _collect_fragments(fragments, source, context="", prior=""):
+    """Append new pieces to the per-file ``fragments`` in/out accumulator.
+
+    Return only the newly appended objects, in splice order, so the caller can
+    insert those same objects among literal reused text. Split large runs only
+    between atomic Markdown blocks, never inside one.
+    """
+    pieces = []
+    current = ""
+    for block in split_into_blocks(source):
+        if current and len((current + block).splitlines()) > MAX_FRAGMENT_LINES:
+            fragment = TranslationFragment(current, context, prior)
+            fragments.append(fragment)
+            pieces.append(fragment)
+            current = ""
+        current += block
+    if current:
+        fragment = TranslationFragment(current, context, prior)
+        fragments.append(fragment)
+        pieces.append(fragment)
+    return pieces
+
+
+def _resolve_fragments(fragments, ai_client, source_language, target_language,
+                       glossary_matcher, source_mode):
+    """Batch one file's fragments, retaining all source-owned splice boundaries."""
+    prepared = {}
+
+    def prepare(fragment):
+        if id(fragment) in prepared:
+            return prepared[id(fragment)]
+        content = preprocess_added_file_batch_for_heading_anchor_stability(
+            fragment.source, source_language, target_language, source_mode=source_mode,
+        )
+        protected, tags, placeholders, prefix = _protect_custom_content_tags(content)
+        protected, svg_map = strip_svgs(protected)
+        prepared[id(fragment)] = content, protected, tags, placeholders, prefix, svg_map
+        return prepared[id(fragment)]
+
+    def normalize(fragment, text):
+        if not isinstance(text, str) or not text.strip() or getattr(text, "partial_reasons", []):
+            return None
+        if fragment.inline:
+            text = text.strip()
+            if ("<span" in text.lower() or "</span>" in text.lower()
+                    or ("\n" not in fragment.source and "\n" in text)):
+                return None
+            return text
+        source = prepare(fragment)[0]
+        if _CUSTOM_CONTENT_TAG_RE.findall(source) != _CUSTOM_CONTENT_TAG_RE.findall(text):
+            return None
+        text = _restore_markdown_indentation(source, text)
+        text = rewrite_tidb_version_anchors_in_text(
+            text, source_language, target_language, source_mode=source_mode,
+        )
+        text = _repair_and_validate_translated_structure(source, text)
+        if text is None:
+            return None
+        if len(text.rstrip().splitlines()) < len(source.rstrip().splitlines()) * 0.6:
+            return None
+        text, partial = repair_suspected_untranslated_tables(
+            source, text, ai_client, source_language=source_language,
+            target_language=target_language, glossary_matcher=glossary_matcher,
+        )
+        if partial:
+            return None
+        # AI never owns code blocks, even when they occur inside a changed run.
+        source_code = [b.rstrip() for b in split_into_blocks(source) if _FENCE_RE.match(b.lstrip())]
+        target_code = [b.rstrip() for b in split_into_blocks(text) if _FENCE_RE.match(b.lstrip())]
+        if source_code != target_code:
+            return None
+        return _strip_trailing_newlines(text) + _trailing_newlines(fragment.source)
+
+    def validate(fragment, text):
+        _, _, tags, placeholders, prefix, svg_map = prepare(fragment)
+        placeholder_re = re.compile(re.escape(prefix) + r"\d+ \}\}\}")
+        if placeholder_re.findall(text) != placeholders:
+            return None
+        for placeholder in svg_map:
+            if text.count(placeholder) != prepare(fragment)[1].count(placeholder):
+                return None
+        text = restore_svgs(text, svg_map)
+        for placeholder, tag in zip(placeholders, tags):
+            text = text.replace(placeholder, tag, 1)
+        return normalize(fragment, text)
+
+    def single(fragment):
+        translated = _translate_preserving_custom_content(
+            fragment.source, ai_client, source_language, target_language,
+            glossary_matcher=glossary_matcher, source_mode=source_mode,
+            context_reference=fragment.context,
+            prior_translation_reference=fragment.prior,
+        )
+        return normalize(fragment, translated)
+
+    return translate_fragments(
+        fragments, ai_client, source_language, target_language, glossary_matcher,
+        lambda fragment: prepare(fragment)[1], validate, single,
+        lambda fragment: prepare_file_translation_request(
+            _protect_custom_content_tags(fragment.source)[0],
+            source_language, target_language, glossary_matcher,
+            source_mode, fragment.context, fragment.prior,
+        )[0],
+    )
 
 
 def _section_heading_key(section):
@@ -691,17 +808,8 @@ def _repair_and_validate_translated_structure(source_content, translated_content
     return repaired
 
 
-def _translate_section_blocks(
-    head_blocks,
-    base_blocks,
-    target_blocks,
-    ai_client,
-    source_language,
-    target_language,
-    glossary_matcher,
-    source_mode,
-):
-    """Translate one changed section while reusing its unchanged blocks.
+def _plan_section_blocks(head_blocks, base_blocks, target_blocks, fragments):
+    """Plan one changed section while reusing its unchanged blocks.
 
     ``base_blocks`` and ``target_blocks`` refer to the corresponding existing
     section.  When their local block counts match, unchanged paragraphs are
@@ -712,22 +820,19 @@ def _translate_section_blocks(
     base_source = "".join(base_blocks)
     prior_translation = "".join(target_blocks) if target_blocks else None
 
-    updated = reconcile_version_mark_only_change(
-        section_source,
-        base_source,
-        prior_translation,
-        ai_client,
-        source_language,
-        target_language,
-        glossary_matcher=glossary_matcher,
-        source_mode=source_mode,
-    )
-    if updated is not None:
-        thread_safe_print(
-            "   ♻️  Reconciler: minimally updated version-mark span and reused "
-            "the rest of its section"
-        )
-        return _strip_trailing_newlines(updated) + _trailing_newlines(section_source)
+    change = _version_mark_only_change(section_source, base_source, prior_translation)
+    if change:
+        inner = _deterministic_version_mark_inner(change)
+        if inner is not None:
+            updated = _replace_span_inner(prior_translation, change["target_span"], inner)
+            return [_strip_trailing_newlines(updated) + _trailing_newlines(section_source)]
+        fragment = TranslationFragment(change["head_inner"], section_source,
+                                       change["target_inner"], inline=True)
+        fragments.append(fragment)
+        span = change["target_span"]
+        return [prior_translation[:span["inner_start"]], fragment,
+                _strip_trailing_newlines(prior_translation[span["inner_end"]:])
+                + _trailing_newlines(section_source)]
 
     if not base_blocks or not target_blocks or len(base_blocks) != len(target_blocks):
         # Without local source/target block parity there is no deterministic,
@@ -735,40 +840,7 @@ def _translate_section_blocks(
         # a translator may legitimately merge or split them. Limit the fallback
         # to this section and provide its existing translation for minimal-edit
         # wording, but do not duplicate section_source as read-only context.
-        translated = _translate_preserving_custom_content(
-            section_source,
-            ai_client,
-            source_language,
-            target_language,
-            glossary_matcher=glossary_matcher,
-            source_mode=source_mode,
-            prior_translation_reference=prior_translation,
-        )
-        if translated is None:
-            return None
-        repaired = _repair_and_validate_translated_structure(
-            section_source, translated
-        )
-        if repaired is None:
-            heading = _section_heading_key(head_blocks) or "(preamble)"
-            thread_safe_print(
-                f"   ❌ Reconciler: AI output changed non-repairable structure "
-                f"for section {heading}"
-            )
-        elif repaired != translated:
-            heading = _section_heading_key(head_blocks) or "(preamble)"
-            thread_safe_print(
-                f"   🛠️  Reconciler: restored source heading level(s) for "
-                f"section {heading}"
-            )
-        if repaired is None:
-            return None
-        # Models commonly omit trailing newlines. They are the separator to the
-        # next heading, so restore the source section's exact newline run before
-        # sections are joined; otherwise ``body### Next`` hides that heading.
-        return _strip_trailing_newlines(repaired) + _trailing_newlines(
-            section_source
-        )
+        return _collect_fragments(fragments, section_source, prior=prior_translation)
 
     base_index = defaultdict(deque)
     for base_position, block in enumerate(base_blocks):
@@ -799,34 +871,10 @@ def _translate_section_blocks(
         while end < len(decisions) and decisions[end][0] == "translate":
             end += 1
         run_source = "".join(head_blocks[index:end])
-        translated = _translate_preserving_custom_content(
-            run_source,
-            ai_client,
-            source_language,
-            target_language,
-            glossary_matcher=glossary_matcher,
-            source_mode=source_mode,
-            context_reference=section_source,
-            prior_translation_reference=prior_translation,
-        )
-        if translated is None:
-            return None
-        translated = _repair_and_validate_translated_structure(
-            run_source, translated
-        )
-        if translated is None:
-            heading = _section_heading_key(head_blocks) or "(preamble)"
-            thread_safe_print(
-                f"   ❌ Reconciler: AI output changed non-repairable structure "
-                f"for translated run in section {heading}"
-            )
-            return None
-        output.append(
-            _strip_trailing_newlines(translated) + _trailing_newlines(run_source)
-        )
+        output.extend(_collect_fragments(fragments, run_source, section_source, prior_translation))
         index = end
 
-    return "".join(output)
+    return output
 
 
 def _section_similarity_text(section):
@@ -980,6 +1028,7 @@ def _reconcile_by_heading_sections(
     source_language = repo_config.get("source_language", "English")
     target_language = repo_config.get("target_language", "Chinese")
     output_sections = []
+    fragments = []
     reused_sections = 0
     changed_sections = 0
     new_sections = 0
@@ -995,37 +1044,32 @@ def _reconcile_by_heading_sections(
                 output_sections.append("".join(target_section))
                 reused_sections += 1
             else:
-                translated_section = _translate_section_blocks(
+                translated_section = _plan_section_blocks(
                     head_section,
                     base_section,
                     target_section,
-                    ai_client,
-                    source_language,
-                    target_language,
-                    glossary_matcher,
-                    source_mode,
+                    fragments,
                 )
                 if translated_section is None:
                     return None
-                output_sections.append(translated_section)
+                output_sections.extend(translated_section)
                 changed_sections += 1
         else:
-            translated_section = _translate_section_blocks(
+            translated_section = _plan_section_blocks(
                 head_section,
                 [],
                 [],
-                ai_client,
-                source_language,
-                target_language,
-                glossary_matcher,
-                source_mode,
+                fragments,
             )
             if translated_section is None:
                 return None
-            output_sections.append(translated_section)
+            output_sections.extend(translated_section)
             new_sections += 1
 
-    reconciled = "".join(output_sections)
+    if not _resolve_fragments(fragments, ai_client, source_language, target_language,
+                              glossary_matcher, source_mode):
+        return None
+    reconciled = render_fragments(output_sections)
     thread_safe_print(
         f"   ♻️  Reconciler: reused {reused_sections} unchanged/moved section(s), "
         f"updated {changed_sections} changed section(s), translated "
@@ -1034,6 +1078,7 @@ def _reconcile_by_heading_sections(
     return reconciled
 
 
+@file_log_context("source_file_path")
 def reconcile_restructured_file(
     source_file_path,
     head_source,
@@ -1148,14 +1193,14 @@ def reconcile_restructured_file(
         else:
             decisions.append(("translate", head_block))
 
-    # Second pass: emit blocks in order, translating each run of consecutive
-    # changed blocks (within one section) as a unit, with the enclosing section
-    # as read-only context.
+    # Collect splice points first, then translate the file's disjoint runs in
+    # bounded requests with deduplicated section context.
     reused_count = sum(1 for kind, _ in decisions if kind == "reuse")
     verbatim_count = sum(1 for kind, _ in decisions if kind == "verbatim")
     translated_count = 0
     run_count = 0
     output_blocks = []
+    fragments = []
 
     index = 0
     total = len(head_blocks)
@@ -1177,30 +1222,22 @@ def reconcile_restructured_file(
             end += 1
 
         run_source = "".join(head_blocks[index:end])
-        translated = _translate_preserving_custom_content(
-            run_source,
-            ai_client,
-            source_language,
-            target_language,
-            glossary_matcher=glossary_matcher,
-            source_mode=source_mode,
-            context_reference=section_source.get(section_id),
-            prior_translation_reference=prior_translation_for(section_id),
-        )
-        if translated is None:
-            return None
-        output_blocks.append(
-            _strip_trailing_newlines(translated) + _trailing_newlines(run_source)
-        )
+        output_blocks.extend(_collect_fragments(
+            fragments, run_source, section_source.get(section_id),
+            prior_translation_for(section_id),
+        ))
         translated_count += end - index
         run_count += 1
         index = end
 
-    reconciled = "".join(output_blocks)
+    if not _resolve_fragments(fragments, ai_client, source_language, target_language,
+                              glossary_matcher, source_mode):
+        return None
+    reconciled = render_fragments(output_blocks)
 
     thread_safe_print(
         f"   ♻️  Reconciler: reused {reused_count} block(s), "
-        f"translated {translated_count} block(s) in {run_count} run(s) with section context, "
+        f"translated {translated_count} block(s) from {run_count} source run(s), "
         f"kept {verbatim_count} code/markup block(s) verbatim"
     )
 

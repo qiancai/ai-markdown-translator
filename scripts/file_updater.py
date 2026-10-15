@@ -10,6 +10,7 @@ import ast
 import difflib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from github import Github
 from openai import OpenAI
 from file_io import atomic_write_text
@@ -27,19 +28,9 @@ from svg_preprocessor import (
     restore_svgs_in_dict,
 )
 
-# Thread-safe printing
-print_lock = threading.Lock()
-
-def thread_safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
-
-def verbose_logging_enabled():
-    return os.getenv("VERBOSE_WORKFLOW_LOGS", "true").lower() in ("1", "true", "yes", "on")
-
-def verbose_thread_safe_print(*args, **kwargs):
-    if verbose_logging_enabled():
-        thread_safe_print(*args, **kwargs)
+from workflow_logging import (
+    thread_safe_print, verbose_thread_safe_print, verbose_logging_enabled, file_log_context,
+)
 
 def read_text_lines_preserve_newlines(file_path):
     """Read text lines without normalizing existing line endings."""
@@ -2132,15 +2123,17 @@ def _execute_ai_translation(
             enc = tiktoken.get_encoding("cl100k_base")
             actual_tokens = len(enc.encode(prompt))
             char_count = len(prompt)
-            thread_safe_print(f"   💰 Document translation ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {char_count:,} characters")
-            thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+            thread_safe_print(
+                f"   💰 Document translation ({source_language} → {target_language}) | Input: {char_count:,} characters | "
+                f"Actual tokens: {actual_tokens:,} (tiktoken cl100k_base)"
+            )
         except Exception:
             estimated_tokens = len(prompt) // 4
             char_count = len(prompt)
-            thread_safe_print(f"   💰 Document translation ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {char_count:,} characters")
-            thread_safe_print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
+            thread_safe_print(
+                f"   💰 Document translation ({source_language} → {target_language}) | Input: {char_count:,} characters | "
+                f"Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)"
+            )
 
     temp_dir = get_temp_output_dir()
     try:
@@ -3171,6 +3164,7 @@ def delete_sections_from_document(file_path, sections_to_delete, target_local_pa
         )
         return False
 
+@file_log_context("file_path")
 def process_single_file(file_path, source_sections, pr_diff, source_context_or_pr_url, github_client, ai_client, repo_config, max_non_system_sections=120, glossary_matcher=None, dry_run=False):
     """Process a single file - thread-safe function for parallel processing"""
     thread_id = threading.current_thread().name
@@ -3594,6 +3588,7 @@ def process_files_in_batches(source_changes, pr_diff, source_context_or_pr_url, 
             future_to_file = {}
             for file_path, source_sections in batch:
                 future = executor.submit(
+                    copy_context().run,
                     process_single_file, 
                     file_path, 
                     source_sections, 

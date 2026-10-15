@@ -1,4 +1,5 @@
 import sys
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -51,12 +52,25 @@ class MockAI:
 
     def chat_completion(self, messages, temperature=0.1):
         self.calls.append(messages)
+        if "Fragment translation input (JSON):\n" in messages[0]["content"]:
+            data = json.loads(messages[0]["content"].split(
+                "Fragment translation input (JSON):\n", 1,
+            )[1])
+            return json.dumps({f["id"]: f["source"] for f in data["fragments"]})
         return self._content_portion(messages[0]["content"])
 
     def contents(self):
         """The block content actually sent for translation (excludes the fixed
         instruction boilerplate, which mentions things like 'Some text ...')."""
-        return [self._content_portion(call[0]["content"]) for call in self.calls]
+        contents = []
+        for call in self.calls:
+            prompt = call[0]["content"]
+            if "Fragment translation input (JSON):\n" in prompt:
+                data = json.loads(prompt.split("Fragment translation input (JSON):\n", 1)[1])
+                contents.extend(f["source"] for f in data["fragments"])
+            else:
+                contents.append(self._content_portion(prompt))
+        return contents
 
     def prompts(self):
         return [call[0]["content"] for call in self.calls]
@@ -837,7 +851,7 @@ class ReconcileFallbackTest(unittest.TestCase):
         )
 
         self.assertIsNone(out)
-        self.assertEqual(len(ai.calls), 1)
+        self.assertEqual(len(ai.calls), 2)
 
     def test_section_translation_repairs_heading_level_drift(self):
         base = "# T\n\n## A\n\nA one.\n\nA two.\n"

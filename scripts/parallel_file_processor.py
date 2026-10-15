@@ -2,10 +2,22 @@
 
 import math
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 
-from ai_client import thread_safe_print
 from log_sanitizer import sanitize_exception_message
+from workflow_logging import log_context, thread_safe_print
+
+
+def _print_progress(*args, **kwargs):
+    """Progress output must not replace a task's result or original exception."""
+    try:
+        thread_safe_print(*args, **kwargs)
+    except (OSError, ValueError):
+        # Broken pipes and closed streams are logging failures, not task failures.
+        pass
 
 
 DEFAULT_PARALLEL_FILE_THRESHOLD = 6
@@ -19,7 +31,7 @@ def _positive_int_from_env(name, default):
     try:
         parsed = int(value)
     except ValueError:
-        thread_safe_print(f"⚠️  Invalid {name}={value!r}; using default {default}")
+        _print_progress(f"⚠️  Invalid {name}={value!r}; using default {default}")
         return default
     return parsed if parsed > 0 else default
 
@@ -83,6 +95,11 @@ def _split_into_chunks(items, chunk_count):
 
 
 def _run_task(index, task):
+    """Capture execution errors; ``ok`` does not describe the business outcome.
+
+    A returned status such as failed or partial must still be checked inside
+    ``result``. Keeping both signals preserves the original task return value.
+    """
     file_path = task["file_path"]
     try:
         return {
@@ -103,7 +120,7 @@ def _run_task(index, task):
 
 
 def _run_chunk(chunk_index, indexed_tasks):
-    thread_safe_print(f"   ⚡ Chunk {chunk_index}: processing {len(indexed_tasks)} file(s)")
+    _print_progress(f"   ⚡ Chunk {chunk_index}: processing {len(indexed_tasks)} file(s)")
     return [_run_task(index, task) for index, task in indexed_tasks]
 
 
@@ -121,9 +138,43 @@ def _chunk_failure_results(indexed_tasks, error):
 
 
 def run_file_tasks(tasks, group_name, parallel_enabled=False, max_workers=None):
+    """Report explicit status dictionaries or booleans, preserving raw results."""
     if not tasks:
         return []
 
+    progress_lock = threading.Lock()
+    counts = {"success": 0, "partial": 0, "failed": 0, "skipped": 0}
+
+    def tracked(task):
+        def run():
+            started = time.monotonic()
+            status = "failed"
+            with log_context(task["file_path"]):
+                _print_progress(f"📄 Started | {group_name}")
+                try:
+                    result = task["func"]()
+                    # Production tasks return an explicit status dictionary.
+                    # Only literal True is accepted as legacy boolean success.
+                    status = result.get("status") if isinstance(result, dict) else (
+                        "success" if result is True else "failed"
+                    )
+                    if not isinstance(status, str) or status not in counts:
+                        status = "failed"
+                    return result
+                finally:
+                    # _run_task captures exceptions; an exception here retains
+                    # the initial failed status and is counted exactly once.
+                    with progress_lock:
+                        counts[status] += 1
+                        _print_progress(
+                            f"📊 Finished: {status} | {time.monotonic() - started:.1f}s | "
+                            f"{group_name}: {sum(counts.values())}/{len(tasks)} processed, "
+                            f"{counts['success']} succeeded, {counts['partial']} partial, "
+                            f"{counts['failed']} failed, {counts['skipped']} skipped"
+                        )
+        return dict(task, func=run)
+
+    tasks = [tracked(task) for task in tasks]
     indexed_tasks = list(enumerate(tasks))
 
     if not parallel_enabled or len(tasks) == 1:
@@ -131,7 +182,7 @@ def run_file_tasks(tasks, group_name, parallel_enabled=False, max_workers=None):
 
     duplicate_resources = has_duplicate_task_resources(tasks)
     if duplicate_resources:
-        thread_safe_print(
+        _print_progress(
             "⚠️  Parallel processing disabled because multiple tasks share output resources: "
             + ", ".join(sorted(duplicate_resources))
         )
@@ -139,7 +190,7 @@ def run_file_tasks(tasks, group_name, parallel_enabled=False, max_workers=None):
 
     worker_count = min(max_workers or get_parallel_file_workers(), len(tasks))
     chunks = _split_into_chunks(indexed_tasks, worker_count)
-    thread_safe_print(
+    _print_progress(
         f"\n⚡ Parallel processing enabled for {group_name}: "
         f"{len(tasks)} file(s) split into {len(chunks)} chunk(s)"
     )
@@ -147,7 +198,9 @@ def run_file_tasks(tasks, group_name, parallel_enabled=False, max_workers=None):
     results = []
     with ThreadPoolExecutor(max_workers=len(chunks), thread_name_prefix="FileChunk") as executor:
         future_to_chunk = {
-            executor.submit(_run_chunk, chunk_index, chunk): (chunk_index, chunk)
+            # Each submission needs its own Context: a Context cannot be entered
+            # by two worker threads at the same time.
+            executor.submit(copy_context().run, _run_chunk, chunk_index, chunk): (chunk_index, chunk)
             for chunk_index, chunk in enumerate(chunks, 1)
         }
         for future in as_completed(future_to_chunk):
@@ -157,7 +210,7 @@ def run_file_tasks(tasks, group_name, parallel_enabled=False, max_workers=None):
                 results.extend(chunk_results)
             except Exception as e:
                 error = sanitize_exception_message(e)
-                thread_safe_print(f"   ❌ Chunk {chunk_index} failed: {error}")
+                _print_progress(f"   ❌ Chunk {chunk_index} failed: {error}")
                 results.extend(_chunk_failure_results(chunk, error))
 
     return sorted(results, key=lambda item: item["index"])

@@ -35,7 +35,8 @@ os.environ.setdefault(
 )
 
 # Import all modules
-from ai_client import UnifiedAIClient, get_provider_max_tokens, thread_safe_print, print_lock
+from ai_client import UnifiedAIClient, get_provider_max_tokens
+from workflow_logging import configure_output, thread_safe_print
 from diff_analyzer import (
     analyze_source_changes,
     build_diff_text,
@@ -369,9 +370,10 @@ def print_token_estimation(prompt_text, context="AI translation"):
     """Print accurate token consumption for a request"""
     actual_tokens = estimate_tokens(prompt_text)
     char_count = len(prompt_text)
-    thread_safe_print(f"   💰 {context}")
-    thread_safe_print(f"      📝 Input: {char_count:,} characters")
-    thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+    thread_safe_print(
+        f"   💰 {context} | Input: {char_count:,} characters | "
+        f"Actual tokens: {actual_tokens:,} (tiktoken cl100k_base)"
+    )
     return actual_tokens
 
 def check_source_token_limit(source_diff_dict_file, token_limit=SOURCE_TOKEN_LIMIT):
@@ -1057,6 +1059,7 @@ def get_workflow_repo_config(pr_url, repo_configs):
 
 def main():
     """Main function - orchestrates the entire workflow for GitHub Actions"""
+    configure_output()
     
     # Validate environment variables
     if not all([SOURCE_PR_URL, TARGET_PR_URL, GITHUB_TOKEN, TARGET_REPO_PATH]):

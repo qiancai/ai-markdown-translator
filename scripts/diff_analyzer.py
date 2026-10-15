@@ -13,7 +13,6 @@ import json
 import os
 import re
 import subprocess
-import threading
 from typing import Optional
 from urllib.parse import urlparse
 from github import Github
@@ -26,13 +25,9 @@ from translation_structure_validator import (
     extract_custom_content_tags,
 )
 
-# Thread-safe printing
-print_lock = threading.Lock()
-
-def thread_safe_print(*args, **kwargs):
-    """Thread-safe print function"""
-    with print_lock:
-        print(*args, **kwargs)
+from workflow_logging import (
+    thread_safe_print, verbose_thread_safe_print,
+)
 
 def is_markdown_heading(line):
     """Return True only for real markdown headings at column 0."""
@@ -149,7 +144,7 @@ def print_range_scope_summary(source_context):
     matched_count = source_context.get("range_matched_file_count")
     if compare_count is None or pr_count is None or matched_count is None:
         return
-    print(
+    verbose_thread_safe_print(
         f"🔎 Range scope: compare files={compare_count}, "
         f"current PR files={pr_count}, matched files={matched_count}"
     )
@@ -428,7 +423,7 @@ def get_pr_diff(pr_url, github_client):
             files = [normalize_changed_file(file) for file in pr.get_files()]
         return build_diff_text(files)
     except Exception as e:
-        print(f"   ❌ Error getting PR diff: {sanitize_exception_message(e)}")
+        thread_safe_print(f"   ❌ Error getting PR diff: {sanitize_exception_message(e)}")
         return None
 
 
@@ -480,7 +475,7 @@ def get_target_file_content(
                 with open(local_file_path, 'r', encoding='utf-8') as f:
                     return f.read(), f"local:{local_file_path}"
             except Exception as e:
-                print(
+                thread_safe_print(
                     f"   ⚠️  Error reading local target file {local_file_path}: {sanitize_exception_message(e)}"
                 )
 
@@ -640,7 +635,7 @@ def maybe_use_normalized_snapshot_operations(operations, base_content, head_cont
     snapshot_count = operations_change_count(snapshot_operations)
 
     if original_count and snapshot_count < original_count:
-        print(
+        verbose_thread_safe_print(
             f"   🧹 Normalized line-ending diff noise: "
             f"{original_count} patch changes -> {snapshot_count} snapshot changes"
         )
@@ -659,7 +654,7 @@ def analyze_diff_operations(file, base_content=None, head_content=None):
     
     patch = file.patch
     if not patch:
-        print(f"   ⚠️  Patch is empty for {getattr(file, 'filename', '?')}; file may exceed GitHub's diff size limit and will not be processed.")
+        thread_safe_print(f"   ⚠️  Patch is empty for {getattr(file, 'filename', '?')}; file may exceed GitHub's diff size limit and will not be processed.")
         return operations
     
     lines = patch.split('\n')
@@ -1154,7 +1149,7 @@ def analyze_diff_operations(file, base_content=None, head_content=None):
         })
         used_deleted_indices.add(deleted_index)
         used_added_indices.add(added_index)
-        thread_safe_print(
+        verbose_thread_safe_print(
             "   🧭 Preferred section-continuity heading match: "
             f"{deleted_header['content'].strip()} -> "
             f"{added_header['content'].strip()} "
@@ -2359,7 +2354,7 @@ def find_sections_by_operation_type(lines, operations, all_headers, base_hierarc
             # Try direct lookup by base line number first (most reliable)
             if base_hierarchy_dict and deleted_base_line_num in base_hierarchy_dict:
                 sections['deleted'].add(deleted_base_line_num)
-                print(f"   🗑️  Detected deleted section: {deleted_line['content']} (line {deleted_base_line_num})")
+                verbose_thread_safe_print(f"   🗑️  Detected deleted section: {deleted_line['content']} (line {deleted_base_line_num})")
                 continue
 
             # Fallback to title matching
@@ -2377,12 +2372,12 @@ def find_sections_by_operation_type(lines, operations, all_headers, base_hierarc
                 
                 if deleted_title == original_title:
                     sections['deleted'].add(line_num)
-                    print(f"   🗑️  Detected deleted section: {deleted_line['content']} (line {line_num})")
+                    verbose_thread_safe_print(f"   🗑️  Detected deleted section: {deleted_line['content']} (line {line_num})")
                     found_deleted = True
                     break
             
             if not found_deleted:
-                print(f"   ⚠️  Could not find deleted section: {deleted_line['content']}")
+                thread_safe_print(f"   ⚠️  Could not find deleted section: {deleted_line['content']}")
     
     return sections
 
@@ -2410,10 +2405,10 @@ def get_target_hierarchy_and_content(
         # Build hierarchy using same method
         hierarchy = build_hierarchy_dict(file_content)
 
-        print(f"   📌 Target baseline source: {target_source}")
+        verbose_thread_safe_print(f"   📌 Target baseline source: {target_source}")
         return hierarchy, lines
     except Exception as e:
-        print(f"   ❌ Error getting target file: {sanitize_exception_message(e)}")
+        thread_safe_print(f"   ❌ Error getting target file: {sanitize_exception_message(e)}")
         return {}, []
 
 def get_source_sections_content(source_context_or_pr_url, file_path, source_affected, github_client):
@@ -2684,9 +2679,9 @@ def find_previous_section_for_added(added_sections, hierarchy_dict):
                 'new_sections': group,
                 'insertion_type': 'multiple' if len(group) > 1 else 'single'
             }
-            print(f"   📍 Added section group: {len(group)} sections after '{previous_section_hierarchy}'")
+            verbose_thread_safe_print(f"   📍 Added section group: {len(group)} sections after '{previous_section_hierarchy}'")
         else:
-            print(f"   ⚠️  Could not find previous section for added sections starting at line {first_new_section}")
+            thread_safe_print(f"   ⚠️  Could not find previous section for added sections starting at line {first_new_section}")
     
     return insertion_points
 
@@ -2772,7 +2767,7 @@ def _collapse_heading_level_pairs(source_diff_dict):
             }
             matched_added.add(add_key)
             matched_deleted.add(del_key)
-            print(
+            verbose_thread_safe_print(
                 f"   📐 Collapsed add+delete pair into heading-level-only change: "
                 f"{del_key}+{add_key} → {modified_key} ({'#' * old_level} → {'#' * new_level})"
             )
@@ -2796,7 +2791,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     has_intro_changes, first_level2_line = detect_intro_section_changes(operations, file_lines)
     
     if has_intro_changes:
-        print(f"   🎯 Pre-section changes detected (before line {first_level2_line})")
+        verbose_thread_safe_print(f"   🎯 Pre-section changes detected (before line {first_level2_line})")
         
         # Independently detect frontmatter changes and intro_section changes.
         # frontmatter  = line 1 → line before first # heading
@@ -2816,7 +2811,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
             operations, intro_start, first_level2_line, base_intro_start, first_level2_line)
         
         if has_fm_changes:
-            print(f"   📋 Frontmatter changes detected (before first # heading)")
+            verbose_thread_safe_print(f"   📋 Frontmatter changes detected (before first # heading)")
             new_fm = extract_frontmatter_content(file_lines)
             old_fm = extract_frontmatter_content(base_file_lines)
             source_diff_dict["frontmatter"] = {
@@ -2826,10 +2821,10 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                 "new_content": new_fm,
                 "old_content": old_fm
             }
-            print(f"   ✅ Frontmatter section added to diff dict")
+            verbose_thread_safe_print(f"   ✅ Frontmatter section added to diff dict")
         
         if has_intro_body_changes:
-            print(f"   📝 Intro section changes detected (# to ##)")
+            verbose_thread_safe_print(f"   📝 Intro section changes detected (# to ##)")
             new_intro, intro_start_line, _ = extract_intro_section_content(file_lines)
             old_intro, base_intro_start_line, _ = extract_intro_section_content(base_file_lines)
             source_diff_dict["intro_section"] = {
@@ -2839,7 +2834,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                 "new_content": new_intro,
                 "old_content": old_intro
             }
-            print(f"   ✅ Intro section added to diff dict (from line {intro_start_line})")
+            verbose_thread_safe_print(f"   ✅ Intro section added to diff dict (from line {intro_start_line})")
         
         # Filter out all sections that are within intro section range
         # These will be handled as part of the intro section
@@ -2859,7 +2854,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
         deleted_sections = {k: v for k, v in deleted_sections.items() 
                            if not is_in_intro_section(int(k))}
         
-        print(f"   🔍 After filtering intro section: {len(modified_sections)} modified, {len(added_sections)} added, {len(deleted_sections)} deleted")
+        verbose_thread_safe_print(f"   🔍 After filtering intro section: {len(modified_sections)} modified, {len(added_sections)} added, {len(deleted_sections)} deleted")
     
     # Helper function to extract section content (only direct content, no sub-sections)
     def extract_section_content_for_diff(line_num, hierarchy_dict):
@@ -2893,7 +2888,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                     return extract_section_direct_content(base_file_lines, base_line_num)
         
         # If exact match not found, return empty string
-        print(f"   ⚠️  Could not find matching hierarchy in base file: {original_hierarchy}")
+        thread_safe_print(f"   ⚠️  Could not find matching hierarchy in base file: {original_hierarchy}")
         return ""
 
     # Full-section fallback for nested/sub-section edits that direct-content extraction can miss
@@ -2986,7 +2981,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                 
                 if not has_next_section:
                     is_bottom_modified = True
-                    print(f"   ✅ Bottom modified section detected at line {line_num_str}: no next section in base file")
+                    verbose_thread_safe_print(f"   ✅ Bottom modified section detected at line {line_num_str}: no next section in base file")
             
             # Use special marker for bottom modified sections
             if is_bottom_modified:
@@ -3015,11 +3010,11 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
 
             source_diff_dict[f"modified_{line_num_str}"] = modified_entry
             if hl_only:
-                print(f"   📐 Heading-level-only change at line {line_num_str}: {'#' * hl_old_level} → {'#' * hl_new_level}")
+                verbose_thread_safe_print(f"   📐 Heading-level-only change at line {line_num_str}: {'#' * hl_old_level} → {'#' * hl_new_level}")
             else:
-                print(f"   ✅ Real modification detected at line {line_num_str}: content changed")
+                verbose_thread_safe_print(f"   ✅ Real modification detected at line {line_num_str}: content changed")
         else:
-            print(f"   🚫 Filtered out false positive at line {line_num_str}: content unchanged (likely line shift artifact)")
+            verbose_thread_safe_print(f"   🚫 Filtered out false positive at line {line_num_str}: content unchanged (likely line shift artifact)")
     
     # Process added sections - find next section from current document hierarchy
     added_line_nums = set(int(ln) for ln in added_sections.keys())
@@ -3139,7 +3134,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
             )
         )
         best_line_num, best_hierarchy = top_candidates[0]
-        print(
+        thread_safe_print(
             f"   ⚠️  {len(top_candidates)} candidates tied at "
             f"parent-hierarchy score {max_score} for '{heading_clean}'; "
             f"chose base line {best_line_num} by ordinal position "
@@ -3151,12 +3146,12 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
     for line_num_str, hierarchy in added_sections.items():
         line_num = int(line_num_str)
         
-        print(f"   🔍 Finding next section for added section at line {line_num}: {hierarchy}")
+        verbose_thread_safe_print(f"   🔍 Finding next section for added section at line {line_num}: {hierarchy}")
         
         # Strategy: Find the next section directly from the current document (post-PR)
         # Get all current sections sorted by line number
         current_sections = sorted([(int(ln), curr_hierarchy) for ln, curr_hierarchy in all_hierarchy_dict.items()])
-        print(f"   📋 Current sections around line {line_num}: {[(ln, h.split(' > ')[-1] if ' > ' in h else h) for ln, h in current_sections if abs(ln - line_num) <= 15]}")
+        verbose_thread_safe_print(f"   📋 Current sections around line {line_num}: {[(ln, h.split(' > ')[-1] if ' > ' in h else h) for ln, h in current_sections if abs(ln - line_num) <= 15]}")
         
         next_section_original_hierarchy = None
         
@@ -3186,7 +3181,7 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                         )
                     )
                     if next_section_original_hierarchy:
-                        print(
+                        verbose_thread_safe_print(
                             f"   ✅ Found next section (modified): line {curr_line_num} -> "
                             f"{next_section_original_hierarchy.split(' > ')[-1]}"
                         )
@@ -3201,20 +3196,20 @@ def build_source_diff_dict(modified_sections, added_sections, deleted_sections, 
                     )
                 )
                 if next_section_original_hierarchy:
-                    print(
+                    verbose_thread_safe_print(
                         f"   ✅ Found next section (by content): "
                         f"{next_section_original_hierarchy.split(' > ')[-1]}"
                     )
                     break
 
-                print(
+                thread_safe_print(
                     f"   ⚠️  Next section at line {curr_line_num} not found in base, "
                     "continuing search..."
                 )
         
         # If no next section found, this is being added at the end
         if not next_section_original_hierarchy:
-            print(f"   ✅ Bottom section detected: this section is added at the end of document")
+            verbose_thread_safe_print(f"   ✅ Bottom section detected: this section is added at the end of document")
             # Use special marker for bottom added sections - no matching needed
             next_section_original_hierarchy = f"bottom-added-{line_num}"
         
@@ -3306,7 +3301,7 @@ def analyze_source_changes(
             target_repo_override=source_context.get("target_repo"),
         )
         source_description = source_context.get("source_description") or f"compare {base_ref}...{head_ref}"
-        print(f"📋 Processing diff: {source_description}")
+        thread_safe_print(f"📋 Processing diff: {source_description}")
         print_range_scope_summary(source_context)
     else:
         source_context = build_pr_diff_context(
@@ -3324,17 +3319,17 @@ def analyze_source_changes(
             for file in source_context["changed_files"]
         ]
         if source_context.get("source_range_url"):
-            print(f"📋 Processing diff: {source_context['source_description']}")
+            thread_safe_print(f"📋 Processing diff: {source_context['source_description']}")
         else:
-            print(f"📋 Processing PR #{source_context['pr_number']}: {source_context['title']}")
+            thread_safe_print(f"📋 Processing PR #{source_context['pr_number']}: {source_context['title']}")
         print_range_scope_summary(source_context)
     
     # Separate markdown files and image files
     markdown_files = [f for f in files if f.filename.endswith('.md')]
     image_files = [f for f in files if is_image_file(f.filename)]
     
-    print(f"📄 Found {len(markdown_files)} markdown files")
-    print(f"🖼️  Found {len(image_files)} image files")
+    verbose_thread_safe_print(f"📄 Found {len(markdown_files)} markdown files")
+    verbose_thread_safe_print(f"🖼️  Found {len(image_files)} image files")
     
     if exclude_folders:
         def _is_excluded(path):
@@ -3346,16 +3341,16 @@ def analyze_source_changes(
         image_files = [f for f in image_files if not _is_excluded(f.filename)]
         
         if excluded_md or excluded_img:
-            print(f"🚫 Early exclusion: skipped {len(excluded_md)} markdown + {len(excluded_img)} image files under {exclude_folders}")
+            verbose_thread_safe_print(f"🚫 Early exclusion: skipped {len(excluded_md)} markdown + {len(excluded_img)} image files under {exclude_folders}")
             for f in excluded_md:
-                print(f"   ⏭️  {f.filename}")
+                verbose_thread_safe_print(f"   ⏭️  {f.filename}")
             for f in excluded_img:
-                print(f"   ⏭️  {f.filename}")
+                verbose_thread_safe_print(f"   ⏭️  {f.filename}")
 
     if requested_source_files:
         markdown_files = [f for f in markdown_files if f.filename in requested_source_files]
         image_files = [f for f in image_files if f.filename in requested_source_files]
-        print(
+        verbose_thread_safe_print(
             "📄 SOURCE_FILES early filter applied before diff analysis: "
             f"{', '.join(sorted(requested_source_files))}"
         )
@@ -3380,83 +3375,83 @@ def analyze_source_changes(
     restructured_files = set()  # Modified files rerouted to full translation
     
     for file in markdown_files:
-        print(f"\n🔍 Analyzing {file.filename}")
+        thread_safe_print(f"\n🔍 Analyzing {file.filename}")
         
         # Check if this file should be ignored
         if file.filename in ignore_files:
-            print(f"   ⏭️  Skipping ignored file: {file.filename}")
+            verbose_thread_safe_print(f"   ⏭️  Skipping ignored file: {file.filename}")
             ignored_files.append(file.filename)
             continue
         
         # Check if this is a completely new file or deleted file
         if file.status == 'added':
-            print(f"   ➕ Detected new file: {file.filename}")
+            verbose_thread_safe_print(f"   ➕ Detected new file: {file.filename}")
             try:
                 file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
                 if should_ignore_related_resources_resource_card_sections(source_context):
                     file_content, skipped_sections = remove_related_resources_resource_card_sections(file_content)
                     if skipped_sections:
-                        print(
+                        verbose_thread_safe_print(
                             f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
                             "from added commit-mode file"
                         )
                         for section in skipped_sections:
-                            print(f"      - {section['hierarchy']}")
+                            verbose_thread_safe_print(f"      - {section['hierarchy']}")
                     if not file_content.strip():
-                        print(
+                        verbose_thread_safe_print(
                             "   ⏭️  Skipping added file because no translatable content remains "
                             "after RelatedResources filtering"
                         )
                         continue
                 added_files[file.filename] = file_content
-                print(f"   ✅ Added complete file for translation")
+                verbose_thread_safe_print(f"   ✅ Added complete file for translation")
                 continue
             except Exception as e:
-                print(f"   ❌ Error getting new file content: {sanitize_exception_message(e)}")
+                thread_safe_print(f"   ❌ Error getting new file content: {sanitize_exception_message(e)}")
                 continue
         
         elif file.status == 'removed':
-            print(f"   🗑️  Detected deleted file: {file.filename}")
+            verbose_thread_safe_print(f"   🗑️  Detected deleted file: {file.filename}")
             deleted_files.append(file.filename)
-            print(f"   ✅ Marked file for deletion")
+            verbose_thread_safe_print(f"   ✅ Marked file for deletion")
             continue
 
         elif file.status == 'renamed':
             previous_filename = getattr(file, 'previous_filename', None)
             if previous_filename:
-                print(f"   🔄 Detected renamed file: {previous_filename} -> {file.filename}")
+                verbose_thread_safe_print(f"   🔄 Detected renamed file: {previous_filename} -> {file.filename}")
                 deleted_files.append(previous_filename)
             else:
-                print(f"   🔄 Detected renamed file without previous path: {file.filename}")
+                verbose_thread_safe_print(f"   🔄 Detected renamed file without previous path: {file.filename}")
 
             try:
                 file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
                 if should_ignore_related_resources_resource_card_sections(source_context):
                     file_content, skipped_sections = remove_related_resources_resource_card_sections(file_content)
                     if skipped_sections:
-                        print(
+                        verbose_thread_safe_print(
                             f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
                             "from renamed commit-mode file"
                         )
                         for section in skipped_sections:
-                            print(f"      - {section['hierarchy']}")
+                            verbose_thread_safe_print(f"      - {section['hierarchy']}")
                     if not file_content.strip():
-                        print(
+                        verbose_thread_safe_print(
                             "   ⏭️  Skipping renamed file because no translatable content remains "
                             "after RelatedResources filtering"
                         )
                         continue
                 added_files[file.filename] = file_content
-                print(f"   ✅ Treating renamed markdown as delete old + add new")
+                verbose_thread_safe_print(f"   ✅ Treating renamed markdown as delete old + add new")
             except Exception as e:
-                print(f"   ❌ Error getting renamed file content: {sanitize_exception_message(e)}")
+                thread_safe_print(f"   ❌ Error getting renamed file content: {sanitize_exception_message(e)}")
             continue
         
         # For modified files, check if it's a special file like TOC.md
         try:
             file_content = repository.get_contents(file.filename, ref=head_ref).decoded_content.decode('utf-8')
         except Exception as e:
-            print(f"   ❌ Error getting content: {sanitize_exception_message(e)}")
+            thread_safe_print(f"   ❌ Error getting content: {sanitize_exception_message(e)}")
             continue
         
         basename = os.path.basename(file.filename)
@@ -3471,11 +3466,11 @@ def analyze_source_changes(
 
         if is_index_file and source_context.get("mode") == "commit":
             if is_learning_path_index_content(file_content):
-                print(f"   📄 Detected LearningPath _index.md file: {file.filename}")
+                verbose_thread_safe_print(f"   📄 Detected LearningPath _index.md file: {file.filename}")
                 try:
                     source_base_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
                 except Exception as e:
-                    print(f"   ⚠️  Could not get base _index.md content: {sanitize_exception_message(e)}")
+                    thread_safe_print(f"   ⚠️  Could not get base _index.md content: {sanitize_exception_message(e)}")
                     source_base_content = ""
 
                 index_files[file.filename] = {
@@ -3483,22 +3478,22 @@ def analyze_source_changes(
                     'source_base_content': source_base_content,
                     'source_head_content': file_content,
                 }
-                print(f"   📄 LearningPath _index.md snapshot sync queued for processing")
+                verbose_thread_safe_print(f"   📄 LearningPath _index.md snapshot sync queued for processing")
                 continue
             else:
-                print(f"   📄 Detected normal _index.md file (has headings, no LearningPath): {file.filename} — using regular translation path")
+                verbose_thread_safe_print(f"   📄 Detected normal _index.md file (has headings, no LearningPath): {file.filename} — using regular translation path")
 
         # Check if this is a special file requiring dedicated processing
         if is_keyword_file or is_toc_file:
             
             # --- keywords.md: keyword-specific processor ---
             if is_keyword_file:
-                print(f"   📋 Detected keyword file: {file.filename}")
+                verbose_thread_safe_print(f"   📋 Detected keyword file: {file.filename}")
                 source_head_lines = split_normalized_lines(file_content)
                 try:
                     base_file_content_preloaded = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
                 except Exception as e:
-                    print(
+                    thread_safe_print(
                         f"   ⚠️  Could not get base keywords.md content: {sanitize_exception_message(e)}"
                     )
                     base_file_content_preloaded = file_content
@@ -3549,12 +3544,12 @@ def analyze_source_changes(
                             target_tabs_region = find_tabs_region(target_lines)
                             target_blocks = parse_letter_blocks(target_lines, target_tabs_region)
                     except Exception as e:
-                        print(
+                        thread_safe_print(
                             f"   ⚠️  Could not get target keyword file content for tabs changes: {sanitize_exception_message(e)}"
                         )
                         target_blocks = {}
 
-                    print(f"   📌 Keyword target baseline source: {target_blocks_source}")
+                    verbose_thread_safe_print(f"   📌 Keyword target baseline source: {target_blocks_source}")
 
                     for letter, change_data in changed_letters.items():
                         tabs_changes[letter] = {
@@ -3569,9 +3564,9 @@ def analyze_source_changes(
                         "type": "keyword",
                         "tabs_changes": tabs_changes
                     }
-                    print(f"   📋 Keyword TabsPanel operations queued: {sorted(tabs_changes.keys())}")
+                    verbose_thread_safe_print(f"   📋 Keyword TabsPanel operations queued: {sorted(tabs_changes.keys())}")
                 else:
-                    print(f"   ℹ️  No TabsPanel letter changes found")
+                    verbose_thread_safe_print(f"   ℹ️  No TabsPanel letter changes found")
 
                 def line_in_tabs_region(line_number, region):
                     if not region:
@@ -3596,7 +3591,7 @@ def analyze_source_changes(
                     ]
                 }
 
-                print(
+                verbose_thread_safe_print(
                     f"   🧹 Filtered non-tabs diff lines: "
                     f"{len(filtered_operations['added_lines'])} added, "
                     f"{len(filtered_operations['modified_lines'])} modified, "
@@ -3609,14 +3604,14 @@ def analyze_source_changes(
                     filtered_operations["modified_lines"],
                     filtered_operations["deleted_lines"]
                 ]):
-                    print(f"   ⏭️  No non-tabs changes in keywords.md, skipping regular section processing")
+                    verbose_thread_safe_print(f"   ⏭️  No non-tabs changes in keywords.md, skipping regular section processing")
                     continue
 
                 keyword_regular_only = True
 
             if is_toc_file:
                 # --- TOC files: TOC-specific processor ---
-                print(f"   📋 Detected special file: {file.filename}")
+                verbose_thread_safe_print(f"   📋 Detected special file: {file.filename}")
 
                 # Get target file content for comparison
                 try:
@@ -3631,9 +3626,9 @@ def analyze_source_changes(
                         target_ref=repo_config.get('target_ref'),
                     )
                     target_lines = split_normalized_lines(target_file_content)
-                    print(f"   📌 TOC target baseline source: {target_source}")
+                    verbose_thread_safe_print(f"   📌 TOC target baseline source: {target_source}")
                 except Exception as e:
-                    print(f"   ⚠️  Could not get target file content: {sanitize_exception_message(e)}")
+                    thread_safe_print(f"   ⚠️  Could not get target file content: {sanitize_exception_message(e)}")
                     continue
 
                 # Analyze diff operations for TOC.md
@@ -3643,7 +3638,7 @@ def analyze_source_changes(
                 try:
                     source_base_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
                 except Exception as e:
-                    print(f"   ⚠️  Could not get base TOC content: {sanitize_exception_message(e)}")
+                    thread_safe_print(f"   ⚠️  Could not get base TOC content: {sanitize_exception_message(e)}")
                     source_base_content = None
 
                 has_toc_diff = any([
@@ -3672,7 +3667,7 @@ def analyze_source_changes(
                             for line in operations['added_lines']
                         ]
                     }
-                    print(f"   📋 TOC snapshot sync queued for processing")
+                    verbose_thread_safe_print(f"   📋 TOC snapshot sync queued for processing")
                 else:
                     # Fallback to legacy operation-level processing.
                     toc_results = process_toc_operations(
@@ -3702,22 +3697,21 @@ def analyze_source_changes(
                             'operations': all_toc_operations
                         }
 
-                        print(f"   📋 TOC operations queued for processing:")
-                        if toc_results['added']:
-                            print(f"      ➕ Added: {len(toc_results['added'])} entries")
-                        if toc_results['modified']:
-                            print(f"      ✏️  Modified: {len(toc_results['modified'])} entries")
-                        if toc_results['deleted']:
-                            print(f"      ❌ Deleted: {len(toc_results['deleted'])} entries")
+                        thread_safe_print(
+                            f"   📋 TOC {file.filename}: "
+                            f"{len(toc_results['added'])} added, "
+                            f"{len(toc_results['modified'])} modified, "
+                            f"{len(toc_results['deleted'])} deleted entries queued"
+                        )
                     else:
-                        print(f"   ℹ️  No TOC operations found")
+                        verbose_thread_safe_print(f"   ℹ️  No TOC operations found")
                 
                 continue  # Skip regular processing for special files
         
         # Analyze diff operations
         if operations is None:
             operations = analyze_diff_operations(file)
-        print(f"   📝 Diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
+        verbose_thread_safe_print(f"   📝 Diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
         
         lines = split_normalized_lines(file_content)
         all_headers = {}
@@ -3770,7 +3764,7 @@ def analyze_source_changes(
                 base_file_content = repository.get_contents(file.filename, ref=base_ref).decoded_content.decode('utf-8')
             base_hierarchy_dict = build_hierarchy_dict(base_file_content)
         except Exception as e:
-            print(f"   ⚠️  Could not get base file content: {sanitize_exception_message(e)}")
+            thread_safe_print(f"   ⚠️  Could not get base file content: {sanitize_exception_message(e)}")
             base_hierarchy_dict = all_hierarchy_dict
             base_file_content = file_content  # Fallback to current content
 
@@ -3787,7 +3781,7 @@ def analyze_source_changes(
             base_file_content,
             file_content,
         )
-        print(f"   📝 Effective diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
+        verbose_thread_safe_print(f"   📝 Effective diff analysis: {len(operations['added_lines'])} added, {len(operations['modified_lines'])} modified, {len(operations['deleted_lines'])} deleted lines")
 
         # TOC and keyword files retain their specialized semantics. LearningPath
         # index files have already continued above; normal index files still use
@@ -3809,7 +3803,7 @@ def analyze_source_changes(
             if formatting_change:
                 formatting_change["source_patch"] = getattr(file, "patch", "") or ""
                 formatting_files[file.filename] = formatting_change
-                print(
+                verbose_thread_safe_print(
                     f"   🧹 Queued {len(formatting_change['changes'])} "
                     "formatting-only change(s) for deterministic target sync"
                 )
@@ -3822,7 +3816,7 @@ def analyze_source_changes(
             file_content, base_file_content, operations
         )
         if is_heading_level_only:
-            print(f"   📐 Detected heading-level-only changes — skipping restructure detection")
+            verbose_thread_safe_print(f"   📐 Detected heading-level-only changes — skipping restructure detection")
 
         # Detect restructured documents (both commit and PR mode): if ALL
         # sub-section headings are in the diff, route the file to full
@@ -3835,29 +3829,29 @@ def analyze_source_changes(
                 or detect_structural_change(base_file_content, file_content)
             )
         ):
-            print(f"   🔄 Detected restructured document (full restructure or moved/rewrapped sections)")
-            print(f"   🔄 Routing {file.filename} to structural reconciliation")
+            verbose_thread_safe_print(f"   🔄 Detected restructured document (full restructure or moved/rewrapped sections)")
+            verbose_thread_safe_print(f"   🔄 Routing {file.filename} to structural reconciliation")
             restructured_content = file_content
             if should_ignore_related_resources_resource_card_sections(source_context):
                 restructured_content, skipped_sections = remove_related_resources_resource_card_sections(
                     restructured_content
                 )
                 if skipped_sections:
-                    print(
+                    verbose_thread_safe_print(
                         f"   🧹 Skipped {len(skipped_sections)} RelatedResources section(s) "
                         "from restructured file"
                     )
                     for section in skipped_sections:
-                        print(f"      - {section['hierarchy']}")
+                        verbose_thread_safe_print(f"      - {section['hierarchy']}")
                 if not restructured_content.strip():
-                    print(
+                    verbose_thread_safe_print(
                         "   ⏭️  Skipping restructured file because no translatable "
                         "content remains after RelatedResources filtering"
                     )
                     continue
             added_files[file.filename] = restructured_content
             restructured_files.add(file.filename)
-            print(f"   ✅ Queued restructured file for full translation")
+            verbose_thread_safe_print(f"   ✅ Queued restructured file for full translation")
             continue
 
         # Find sections by operation type with corrected logic
@@ -3874,7 +3868,7 @@ def analyze_source_changes(
         
         # Enhanced logic: check for actual content changes within sections
         # This helps detect changes in section content (not just headers)
-        print(f"   🔍 Enhanced detection: checking for actual section content changes...")
+        verbose_thread_safe_print(f"   🔍 Enhanced detection: checking for actual section content changes...")
         
         # Get only lines that have actual content changes (exclude headers)
         real_content_changes = set()
@@ -3903,7 +3897,7 @@ def analyze_source_changes(
             if not modified_line['is_header'] or modified_line['line_number'] not in all_headers:
                 real_content_changes.add(modified_line['line_number'])
         
-        print(f"   📝 Real content changes (non-header): {sorted(real_content_changes)}")
+        verbose_thread_safe_print(f"   📝 Real content changes (non-header): {sorted(real_content_changes)}")
         
         # Identify true content modification positions: lines that have both
         # an addition and a deletion at the same head-side position.  These
@@ -3939,7 +3933,7 @@ def analyze_source_changes(
                         deleted_head_line is not None and
                         abs(changed_line - deleted_head_line) <= 2):
                         is_deleted_header = True
-                        print(f"   ⚠️  Skipping change at line {changed_line} (deleted header near line {deleted_head_line})")
+                        thread_safe_print(f"   ⚠️  Skipping change at line {changed_line} (deleted header near line {deleted_head_line})")
                         break
                 
                 # More precise filtering: check if this change is actually meaningful
@@ -3952,7 +3946,7 @@ def analyze_source_changes(
                     if (deleted_line['is_header'] and 
                         changed_line == deleted_head_line):
                         should_include = False
-                        print(f"   ⚠️  Skipping change at line {changed_line} (exact deleted header)")
+                        thread_safe_print(f"   ⚠️  Skipping change at line {changed_line} (exact deleted header)")
                         break
                 
                 # Skip changes that are very close to deleted content AND far from their containing section.
@@ -3968,7 +3962,7 @@ def analyze_source_changes(
                         
                         if (distance_to_deletion <= 5 and distance_to_section > 100):
                             should_include = False
-                            print(f"   ⚠️  Skipping change at line {changed_line} (likely line shift: {distance_to_deletion} lines from deletion, {distance_to_section} from section)")
+                            thread_safe_print(f"   ⚠️  Skipping change at line {changed_line} (likely line shift: {distance_to_deletion} lines from deletion, {distance_to_section} from section)")
                             break
 
                 if should_include: # filtering legitimate changes in large sections or at section ends
@@ -3983,7 +3977,7 @@ def analyze_source_changes(
                 and line_num not in sections_by_type['deleted']
             ):
                 if line_num not in sections_by_type['modified']:
-                    print(f"   🧩 Added structural-wrapper-modified section at line {line_num}")
+                    verbose_thread_safe_print(f"   🧩 Added structural-wrapper-modified section at line {line_num}")
                 sections_by_type['modified'].add(line_num)
 
         for line_num in content_affected_sections:
@@ -3991,9 +3985,9 @@ def analyze_source_changes(
                 line_num not in sections_by_type['added'] and
                 line_num not in sections_by_type['deleted']):  # ✅ Critical fix: exclude deleted sections      
                 sections_by_type['modified'].add(line_num)
-                print(f"   📝 Added content-modified section at line {line_num}")
+                verbose_thread_safe_print(f"   📝 Added content-modified section at line {line_num}")
             elif line_num in sections_by_type['deleted']:
-                print(f"   🚫 Skipping content-modified section at line {line_num}: already marked as deleted")
+                verbose_thread_safe_print(f"   🚫 Skipping content-modified section at line {line_num}: already marked as deleted")
         
         # Prepare sections data for source_diff_dict
         file_modified = {}
@@ -4015,7 +4009,7 @@ def analyze_source_changes(
             if line_num in base_hierarchy_dict:
                 file_deleted[str(line_num)] = base_hierarchy_dict[line_num]
         
-        print(f"   📊 Real content changes: {sorted(real_content_changes)}")
+        verbose_thread_safe_print(f"   📊 Real content changes: {sorted(real_content_changes)}")
         
         # Build source diff dictionary
         source_diff_dict = build_source_diff_dict(
@@ -4026,12 +4020,12 @@ def analyze_source_changes(
 
         if basename == "keywords.md" and keyword_regular_only:
             source_diff_dict, dropped_entries = normalize_keywords_regular_source_diff(source_diff_dict)
-            print(
+            verbose_thread_safe_print(
                 f"   🔧 keywords.md regular diff normalized: "
                 f"{len(source_diff_dict)} kept, {dropped_entries} dropped"
             )
             if not source_diff_dict:
-                print(f"   ⏭️  No non-tabs section content remains after normalization")
+                verbose_thread_safe_print(f"   ⏭️  No non-tabs section content remains after normalization")
                 continue
 
         if should_ignore_related_resources_resource_card_sections(source_context):
@@ -4039,16 +4033,16 @@ def analyze_source_changes(
                 source_diff_dict
             )
             if skipped_related_entries:
-                print(
+                verbose_thread_safe_print(
                     f"   🧹 Skipped {len(skipped_related_entries)} RelatedResources section(s) "
                     "from commit-mode diff analysis"
                 )
                 for key, diff_info in skipped_related_entries:
-                    print(
+                    verbose_thread_safe_print(
                         f"      - {key}: {diff_info.get('original_hierarchy', '')}"
                     )
                 if not source_diff_dict:
-                    print(
+                    verbose_thread_safe_print(
                         "   ⏭️  No translatable section changes remain after "
                         "RelatedResources filtering"
                     )
@@ -4060,7 +4054,7 @@ def analyze_source_changes(
             # and turn an intentional no-op into a misleading matcher failure.
             modified_sections.pop(file.filename, None)
             empty_source_diff_files.append(file.filename)
-            print(
+            verbose_thread_safe_print(
                 "   ⏭️  No translatable section changes remain; "
                 "skipping regular modified-file processing"
             )
@@ -4078,10 +4072,10 @@ def analyze_source_changes(
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(source_diff_dict, f, ensure_ascii=False, indent=2)
         
-        print(f"   💾 Saved source diff dictionary to: {output_file}")
-        print(f"   📊 Source diff dictionary contains {len(source_diff_dict)} sections:")
+        verbose_thread_safe_print(f"   💾 Saved source diff dictionary to: {output_file}")
+        verbose_thread_safe_print(f"   📊 Source diff dictionary contains {len(source_diff_dict)} sections:")
         for key, diff_info in source_diff_dict.items():
-            print(f"      {diff_info['operation']}: {key} -> original_hierarchy: {diff_info['original_hierarchy']}")
+            verbose_thread_safe_print(f"      {diff_info['operation']}: {key} -> original_hierarchy: {diff_info['original_hierarchy']}")
         
         # source-diff-dict.json generation is complete, continue to next step in main.py
         
@@ -4129,7 +4123,7 @@ def analyze_source_changes(
                     'sections': file_added,
                     'insertion_points': insertion_points
                 }
-                print(f"   ➕ Found {len(file_added)} added sections with {len(insertion_points)} insertion points")
+                verbose_thread_safe_print(f"   ➕ Found {len(file_added)} added sections with {len(insertion_points)} insertion points")
         
         # Process modified sections
         if sections_by_type['modified']:
@@ -4147,7 +4141,7 @@ def analyze_source_changes(
                 if basename == "keywords.md" and keyword_regular_only:
                     modified_entry['keyword_regular_only'] = True
                 modified_sections[file.filename] = modified_entry
-                print(f"   ✏️  Found {len(file_modified)} modified sections")
+                verbose_thread_safe_print(f"   ✏️  Found {len(file_modified)} modified sections")
         
         # Process deleted sections  
         if sections_by_type['deleted']:
@@ -4159,11 +4153,11 @@ def analyze_source_changes(
             
             if file_deleted:
                 deleted_sections[file.filename] = file_deleted
-                print(f"   ❌ Found {len(file_deleted)} deleted sections")
+                thread_safe_print(f"   ❌ Found {len(file_deleted)} deleted sections")
         
         # Enhanced logic: also check content-level changes using legacy detection
         # This helps detect changes in section content (not just headers)
-        print(f"   🔍 Enhanced detection: checking content-level changes...")
+        verbose_thread_safe_print(f"   🔍 Enhanced detection: checking content-level changes...")
         changed_lines = [
             line_number
             for line_number in get_changed_line_numbers_from_operations(operations)
@@ -4190,7 +4184,7 @@ def analyze_source_changes(
                     legacy_modified[str(line_num)] = section_hierarchy
         
         if legacy_modified:
-            print(f"   ✅ Enhanced detection found {len(legacy_modified)} additional content-modified sections")
+            verbose_thread_safe_print(f"   ✅ Enhanced detection found {len(legacy_modified)} additional content-modified sections")
             # Merge with existing modified sections
             if file.filename in modified_sections:
                 # Merge the sections
@@ -4245,57 +4239,57 @@ def analyze_source_changes(
                     'original_hierarchy': all_hierarchy_dict,
                     'current_hierarchy': all_hierarchy_dict
                 }
-                print(f"   ✏️  Added file to modified_sections via source_diff_dict-only work: {list(synthetic_sections.values())}")
+                verbose_thread_safe_print(f"   ✏️  Added file to modified_sections via source_diff_dict-only work: {list(synthetic_sections.values())}")
     
     # Process image files
-    print(f"\n🖼️  Analyzing image files...")
+    verbose_thread_safe_print(f"\n🖼️  Analyzing image files...")
     for file in image_files:
-        print(f"\n🔍 Analyzing image: {file.filename}")
+        thread_safe_print(f"\n🔍 Analyzing image: {file.filename}")
         
         # Check if this file should be ignored
         if file.filename in ignore_files:
-            print(f"   ⏭️  Skipping ignored image: {file.filename}")
+            verbose_thread_safe_print(f"   ⏭️  Skipping ignored image: {file.filename}")
             ignored_files.append(file.filename)
             continue
         
         # Categorize image operations based on file status
         if file.status == 'added':
-            print(f"   ➕ Detected new image: {file.filename}")
+            verbose_thread_safe_print(f"   ➕ Detected new image: {file.filename}")
             added_images.append(file.filename)
         elif file.status == 'removed':
-            print(f"   🗑️  Detected deleted image: {file.filename}")
+            verbose_thread_safe_print(f"   🗑️  Detected deleted image: {file.filename}")
             deleted_images.append(file.filename)
         elif file.status == 'modified':
-            print(f"   🔄 Detected modified image: {file.filename}")
+            verbose_thread_safe_print(f"   🔄 Detected modified image: {file.filename}")
             modified_images.append(file.filename)
         elif file.status == 'renamed':
             # Renamed images are treated as delete old + add new
-            print(f"   🔄 Detected renamed image: {file.previous_filename} -> {file.filename}")
+            verbose_thread_safe_print(f"   🔄 Detected renamed image: {file.previous_filename} -> {file.filename}")
             if hasattr(file, 'previous_filename') and file.previous_filename:
                 deleted_images.append(file.previous_filename)
             added_images.append(file.filename)
     
-    print(f"\n📊 Summary:")
+    thread_safe_print(f"\n📊 Summary:")
     #print(f"   ✏️  Modified files: {} files") 
-    print(f"   📄 Added files: {len(added_files)} files")
-    print(f"   🗑️  Deleted files: {len(deleted_files)} files")
-    print(f"   📋 TOC files: {len(toc_files)} files")
-    print(f"   📋 Keyword files: {len(keyword_files)} files")
-    print(f"   🧹 Formatting-only files: {len(formatting_files)} files")
-    print(f"   🖼️  Added images: {len(added_images)} images")
-    print(f"   🖼️  Modified images: {len(modified_images)} images")
-    print(f"   🖼️  Deleted images: {len(deleted_images)} images")
+    thread_safe_print(f"   📄 Added files: {len(added_files)} files")
+    thread_safe_print(f"   🗑️  Deleted files: {len(deleted_files)} files")
+    thread_safe_print(f"   📋 TOC files: {len(toc_files)} files")
+    thread_safe_print(f"   📋 Keyword files: {len(keyword_files)} files")
+    thread_safe_print(f"   🧹 Formatting-only files: {len(formatting_files)} files")
+    thread_safe_print(f"   🖼️  Added images: {len(added_images)} images")
+    thread_safe_print(f"   🖼️  Modified images: {len(modified_images)} images")
+    thread_safe_print(f"   🖼️  Deleted images: {len(deleted_images)} images")
     if ignored_files:
-        print(f"   ⏭️  Ignored files: {len(ignored_files)} files")
+        thread_safe_print(f"   ⏭️  Ignored files: {len(ignored_files)} files")
         for ignored_file in ignored_files:
-            print(f"      - {ignored_file}")
+            thread_safe_print(f"      - {ignored_file}")
     if empty_source_diff_files:
-        print(
+        thread_safe_print(
             "   ⏭️  Canonical no-op modified files: "
             f"{len(empty_source_diff_files)} files"
         )
         for no_op_file in empty_source_diff_files:
-            print(f"      - {no_op_file}")
+            thread_safe_print(f"      - {no_op_file}")
 
     result = (
         added_sections,

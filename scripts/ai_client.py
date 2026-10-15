@@ -30,13 +30,8 @@ except ImportError:
         genai = None
 
 # ---------------------------------------------------------------------------
-# Thread-safe printing (also re-exported for callers)
-# ---------------------------------------------------------------------------
-print_lock = threading.Lock()
-
-def thread_safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
+# Keep legacy logging exports; new callers import workflow_logging directly.
+from workflow_logging import thread_safe_print, print_lock as print_lock, log_ai_wait
 
 # ---------------------------------------------------------------------------
 # API keys / endpoints  (read once at import time)
@@ -176,6 +171,7 @@ class UnifiedAIClient:
             raise ValueError(f"Unsupported AI provider: {provider}")
 
     # -----------------------------------------------------------------------
+    @log_ai_wait
     def chat_completion(self, messages, temperature=0.1, max_tokens=None):
         """Unified chat completion interface."""
         if max_tokens is None:

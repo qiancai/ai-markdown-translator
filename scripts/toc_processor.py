@@ -6,18 +6,12 @@ Handles special processing logic for TOC.md files
 import os
 import re
 import json
-import threading
 from github import Github
 from openai import OpenAI
 from file_io import atomic_write_text
 from log_sanitizer import sanitize_exception_message, safe_target_path
 
-# Thread-safe printing
-print_lock = threading.Lock()
-
-def thread_safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
+from workflow_logging import thread_safe_print
 
 
 TOC_LIST_TEXT_LINE_RE = re.compile(r'^(\s*-\s+)(.*)$')
@@ -889,16 +883,18 @@ Return format:
             tokens = enc.encode(prompt)
             actual_tokens = len(tokens)
             char_count = len(prompt)
-            print(f"   💰 TOC translation")
-            print(f"      📝 Input: {char_count:,} characters")
-            print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+            thread_safe_print(
+                f"   💰 TOC translation | Input: {char_count:,} characters | "
+                f"Actual tokens: {actual_tokens:,} (tiktoken cl100k_base)"
+            )
         except Exception:
             # Final fallback to character approximation
             estimated_tokens = len(prompt) // 4
             char_count = len(prompt)
-            print(f"   💰 TOC translation")
-            print(f"      📝 Input: {char_count:,} characters")
-            print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
+            thread_safe_print(
+                f"   💰 TOC translation | Input: {char_count:,} characters | "
+                f"Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)"
+            )
     
     try:
         ai_response = ai_client.chat_completion(

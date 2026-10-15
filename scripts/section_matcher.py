@@ -6,25 +6,14 @@ Handles section hierarchy matching including direct matching and AI matching
 import os
 import re
 import json
-import threading
 from github import Github
 from openai import OpenAI
 from log_sanitizer import sanitize_exception_message
 from product_specific_handler import get_product_name
 
-# Thread-safe printing
-print_lock = threading.Lock()
-
-def thread_safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
-
-def verbose_logging_enabled():
-    return os.getenv("VERBOSE_WORKFLOW_LOGS", "true").lower() in ("1", "true", "yes", "on")
-
-def verbose_thread_safe_print(*args, **kwargs):
-    if verbose_logging_enabled():
-        thread_safe_print(*args, **kwargs)
+from workflow_logging import (
+    thread_safe_print, verbose_thread_safe_print,
+)
 
 def is_markdown_heading(line):
     """True only for real markdown headings at column 0."""
@@ -547,16 +536,18 @@ Please select the corresponding {number_of_sections} section(s) in {target_langu
             tokens = enc.encode(prompt)
             actual_tokens = len(tokens)
             char_count = len(prompt)
-            thread_safe_print(f"   💰 Section mapping ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {char_count:,} characters")
-            thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+            thread_safe_print(
+                f"   💰 Section mapping ({source_language} → {target_language}) | Input: {char_count:,} characters | "
+                f"Actual tokens: {actual_tokens:,} (tiktoken cl100k_base)"
+            )
         except Exception:
             # Final fallback to character approximation
             estimated_tokens = len(prompt) // 4
             char_count = len(prompt)
-            thread_safe_print(f"   💰 Section mapping ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {char_count:,} characters")
-            thread_safe_print(f"      🔢 Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)")
+            thread_safe_print(
+                f"   💰 Section mapping ({source_language} → {target_language}) | Input: {char_count:,} characters | "
+                f"Estimated tokens: ~{estimated_tokens:,} (fallback: 4 chars/token approximation)"
+            )
 
     try:
         ai_response = ai_client.chat_completion(
@@ -673,13 +664,15 @@ Example shape:
             import tiktoken
             enc = tiktoken.get_encoding("cl100k_base")
             actual_tokens = len(enc.encode(prompt))
-            thread_safe_print(f"   💰 Section JSON mapping ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {len(prompt):,} characters")
-            thread_safe_print(f"      🔢 Actual tokens: {actual_tokens:,} (using tiktoken cl100k_base)")
+            thread_safe_print(
+                f"   💰 Section JSON mapping ({source_language} → {target_language}) | Input: {len(prompt):,} characters | "
+                f"Actual tokens: {actual_tokens:,} (tiktoken cl100k_base)"
+            )
         except Exception:
-            thread_safe_print(f"   💰 Section JSON mapping ({source_language} → {target_language})")
-            thread_safe_print(f"      📝 Input: {len(prompt):,} characters")
-            thread_safe_print(f"      🔢 Estimated tokens: ~{len(prompt) // 4:,} (fallback: 4 chars/token approximation)")
+            thread_safe_print(
+                f"   💰 Section JSON mapping ({source_language} → {target_language}) | Input: {len(prompt):,} characters | "
+                f"Estimated tokens: ~{len(prompt) // 4:,} (fallback: 4 chars/token approximation)"
+            )
 
     try:
         ai_response = ai_client.chat_completion(
