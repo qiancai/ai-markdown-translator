@@ -19,6 +19,11 @@ MARKDOWN_LINK_TARGET_CAPTURE_RE = re.compile(r"\]\(([^)]+)\)")
 URL_RE = re.compile(r"https?://\S+")
 NUMBER_RE = re.compile(r"(?<![A-Za-z_])\d+(?:[.,]\d+)*(?:%|x)?")
 UPPER_IDENTIFIER_RE = re.compile(r"\b[A-Z][A-Z0-9_]{1,}\b")
+# Match complete product names, leaving descriptive suffixes for translation.
+PRODUCT_NAME_RE = re.compile(
+    r"\b(?:TiDB(?:\s+Cloud)?(?:\s+(?:Starter|Essential|Premium|Dedicated|Serverless|X))?"
+    r"|TiKV|TiFlash|TiCDC|MySQL|PostgreSQL)\b"
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,7 @@ def contains_translatable_natural_language(text, source_language):
     normalized_language = (source_language or "").strip().lower()
 
     if normalized_language == "english":
+        candidate = PRODUCT_NAME_RE.sub(" ", candidate)
         return any(
             len(word) >= 2 and any(character.islower() for character in word)
             for word in ENGLISH_WORD_RE.findall(candidate)
@@ -187,6 +193,37 @@ def _names_or_values_column(header, source_language):
         "option", "options", "status", "mode", "type", "types", "value", "values",
         "default", "function", "functions", "signature",
     } or normalized.endswith((" name", " names", " label", " labels", " code", " identifier"))
+
+
+def _is_name_or_value_cell(header, cell, source_language):
+    """Treat the column as evidence of a name, not a blanket prose exemption."""
+    if not _names_or_values_column(header, source_language):
+        return False
+    # Entire bold labels conventionally identify exact UI text.
+    if re.fullmatch(r"\*\*[^\n]+\*\*", cell.strip()):
+        return True
+    candidate = INLINE_CODE_RE.sub(" ", cell)
+    candidate = MARKDOWN_LINK_TARGET_RE.sub("]", candidate)
+    candidate = URL_RE.sub(" ", candidate)
+    candidate = DOC_VARIABLE_RE.sub(" ", candidate)
+    candidate = HTML_TAG_RE.sub(" ", candidate)
+    words = ENGLISH_WORD_RE.findall(candidate.lower())
+    # Sentence punctuation, articles, auxiliaries and connective words distinguish
+    # explanations from short labels such as Owner token or Query duration.
+    if re.search(r"[.!?](?:\s|$)", candidate):
+        return False
+    if words and words[0] in {
+        "allows", "contains", "controls", "enables", "provides", "requires",
+        "returns", "runs", "stores", "supports", "uses",
+    }:
+        return False
+    if len(words) >= 3 and set(words) & {
+        "a", "an", "the", "this", "these", "it", "they", "is", "are", "was",
+        "were", "can", "cannot", "must", "should", "will", "in", "by", "with",
+        "for", "from", "to",
+    }:
+        return False
+    return True
 
 
 def table_shapes_match(source_table, target_table):
@@ -269,7 +306,7 @@ def find_suspected_table_omissions(
                 1,
             )
             if any(
-                not _names_or_values_column(header, source_language)
+                not _is_name_or_value_cell(header, source_cell, source_language)
                 and source_cell == target_cell
                 and contains_likely_prose_cell(source_cell, source_language)
                 for header, source_cell, target_cell in zip(

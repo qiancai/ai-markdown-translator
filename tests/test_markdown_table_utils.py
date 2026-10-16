@@ -122,6 +122,44 @@ class MarkdownTableUtilsTest(unittest.TestCase):
         self.assertEqual(1, len(omissions))
         self.assertIn("header", omissions[0].reason)
 
+    def test_product_name_headers_do_not_trigger_repairs(self):
+        from file_adder import repair_suspected_untranslated_tables
+
+        for product in ("TiDB X", "**TiDB Cloud Starter**", "PostgreSQL"):
+            with self.subTest(product=product):
+                source = f"| Feature | {product} |\n| --- | --- |\n| Storage | Fully managed storage |"
+                target = f"| 功能 | {product} |\n| --- | --- |\n| 存储 | 完全托管的存储 |"
+                ai = mock.Mock()
+                self.assertEqual([], find_suspected_table_omissions(source, target))
+                self.assertEqual((target, []), repair_suspected_untranslated_tables(source, target, ai))
+                ai.chat_completion.assert_not_called()
+
+    def test_description_beside_a_product_name_is_still_translatable(self):
+        for header in ("Description", "TiDB X Description", "TiDB Cloud Starter features"):
+            with self.subTest(header=header):
+                source = f"| Feature | {header} |\n| --- | --- |\n| Storage | Managed storage |"
+                target = f"| 功能 | {header} |\n| --- | --- |\n| 存储 | 托管存储 |"
+                omissions = find_suspected_table_omissions(source, target)
+                self.assertEqual(1, len(omissions))
+                self.assertIn("header", omissions[0].reason)
+
+    def test_sentence_in_a_name_column_is_not_exempt(self):
+        for header in ("Type", "Option", "Platform", "Name"):
+            for prose in ("A database hosted in your cloud account.",
+                          "The database runs in your account",
+                          "Requests can access data", "Controls access.", "Controls access"):
+                with self.subTest(header=header, prose=prose):
+                    source = f"| {header} | Description |\n| --- | --- |\n| {prose} | Controls access |"
+                    target = f"| 类型 | 描述 |\n| --- | --- |\n| {prose} | 控制访问 |"
+                    omissions = find_suspected_table_omissions(source, target)
+                    self.assertEqual(1, len(omissions))
+                    self.assertIn("body row", omissions[0].reason)
+
+    def test_explicit_ui_labels_remain_exempt(self):
+        source = "| Option | Description |\n| --- | --- |\n| **Use an existing VPC** | Controls access |"
+        target = source.replace("Option", "选项").replace("Description", "描述").replace("Controls access", "控制访问")
+        self.assertEqual([], find_suspected_table_omissions(source, target))
+
     def test_regular_document_links_are_not_exempt_from_translation(self):
         source = "| Documentation |\n| --- |\n| [Installation guide](/guide.md) |"
         target = source.replace("Documentation", "文档")
