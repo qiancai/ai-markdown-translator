@@ -1461,6 +1461,15 @@ def reconcile_restructured_files(
             continue
 
         if rr_ignore:
+            _, target_resource_sections = remove_related_resources_resource_card_sections(
+                existing_target
+            )
+            if not target_resource_sections:
+                # Some locales omit these language-specific sections entirely.
+                # Exclude them from both source snapshots before aligning with
+                # that target, including source-only additions and deletions.
+                base_source, _ = remove_related_resources_resource_card_sections(base_source)
+                head_source, _ = remove_related_resources_resource_card_sections(head_source)
             # A localized target can legitimately retain this ignored section.
             # Keep full documents aligned and make the section immutable by
             # restoring its BASE source form in the effective HEAD snapshot.

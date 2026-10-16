@@ -203,7 +203,7 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         with mock.patch.object(
             workflow, "TARGET_REPO_PATH", "/tmp/target"
         ), mock.patch.object(
-            workflow, "read_target_file_content", return_value="# 既存\n"
+            workflow, "read_target_file_content", return_value=base_source
         ), mock.patch.object(
             workflow, "get_source_ref_content", side_effect=source_at_ref
         ), mock.patch.object(
@@ -228,6 +228,46 @@ class CommitSyncWorkflowHelpersTest(unittest.TestCase):
         self.assertNotIn("guide.md", full_translation_paths)
         self.assertEqual(1, len(stats.failed))
         self.assertIn("section count changed", stats.failed[0][1])
+
+    def test_restructured_reconciliation_ignores_resources_absent_from_target(self):
+        content = "# Guide\n\n## Content\n\nOld body.\n\n"
+        resources = (
+            "## Related resources\n\n<RelatedResources>\n"
+            '  <ResourceCard title="Source only" />\n</RelatedResources>\n'
+        )
+        target = "# 指南\n\n## 内容\n\n原有正文。\n\n"
+        for base_suffix, head_suffix in [(resources, resources), (resources, ""), ("", resources)]:
+            with self.subTest(base_resources=bool(base_suffix), head_resources=bool(head_suffix)):
+                stats = workflow.TranslationStats()
+                ai = mock.Mock(max_tokens=65536)
+                ai.chat_completion.side_effect = lambda messages, **kwargs: messages[0]["content"].split(
+                    "Content to translate:\n", 1
+                )[1].replace("New body.", "新的正文。")
+
+                def source_at_ref(_path, _context, _github, ref_name):
+                    return (content.replace("Old body.", "New body.") + head_suffix
+                            if ref_name == "head_ref" else content + base_suffix)
+
+                with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+                    workflow, "TARGET_REPO_PATH", tmpdir
+                ), mock.patch.object(
+                    workflow, "read_target_file_content", return_value=target
+                ), mock.patch.object(
+                    workflow, "get_source_ref_content", side_effect=source_at_ref
+                ), mock.patch.object(workflow, "git_add_changes"):
+                    result = workflow.reconcile_restructured_files(
+                        {"guide.md"}, {}, set(), {"mode": "commit"}, object(), ai,
+                        {"ignore_resource_card_section": True,
+                         "source_language": "English", "target_language": "Chinese"},
+                        None, stats, set(),
+                    )
+                    written = Path(tmpdir, "guide.md").read_text()
+                self.assertEqual({"guide.md"}, result)
+                self.assertEqual([], stats.failed)
+                self.assertIn("# 指南", written)
+                self.assertIn("新的正文。", written)
+                self.assertNotIn("RelatedResources", written)
+                ai.chat_completion.assert_called_once()
 
     def test_normalize_source_files_prefixes_folder(self):
         normalized = workflow.normalize_source_files("foo.md, ai/bar.md ,baz/qux.md", "ai")

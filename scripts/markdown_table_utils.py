@@ -1,5 +1,6 @@
 """Markdown table parsing and untranslated-content detection helpers."""
 
+from collections import Counter
 from dataclasses import dataclass
 import re
 
@@ -147,6 +148,9 @@ def contains_translatable_natural_language(text, source_language):
 
 def contains_likely_prose_cell(cell, source_language):
     """Return whether a table cell looks like natural-language prose."""
+    # A repository README link names a document, rather than describing an action.
+    if re.fullmatch(r"\[(?:[\w.-]+\s+)?README(?:\.\w+)?\]\([^)]+\)", cell.strip()):
+        return False
     candidate = INLINE_CODE_RE.sub(" ", cell)
     candidate = HTML_TAG_RE.sub(" ", candidate)
     candidate = DOC_VARIABLE_RE.sub(" ", candidate)
@@ -165,6 +169,24 @@ def contains_likely_prose_cell(cell, source_language):
     if normalized_language == "japanese":
         return bool(JAPANESE_RE.search(candidate))
     return sum(character.isalpha() for character in candidate) >= 4
+
+
+def _normalized_header(header):
+    return " ".join(re.sub(r"[*_`]", "", header).lower().split())
+
+
+def _names_or_values_column(header, source_language):
+    """Use column semantics to distinguish exact names from descriptive prose."""
+    if (source_language or "").strip().lower() != "english":
+        return False
+    normalized = _normalized_header(header)
+    return normalized in {
+        "name", "names", "label", "labels", "credential", "credentials",
+        "provider", "providers", "language", "languages", "platform", "platforms",
+        "parameter", "parameters", "field", "fields", "setting", "settings",
+        "option", "options", "status", "mode", "type", "types", "value", "values",
+        "default", "function", "functions", "signature",
+    } or normalized.endswith((" name", " names", " label", " labels", " code", " identifier"))
 
 
 def table_shapes_match(source_table, target_table):
@@ -192,7 +214,7 @@ def find_suspected_table_omissions(
     target_content,
     source_language="English",
 ):
-    """Find unchanged tables or unchanged headers with translated body rows."""
+    """Find unchanged prose, excluding exact names identified by column context."""
     source_tables = extract_markdown_tables(source_content)
     target_tables = extract_markdown_tables(target_content)
     if len(source_tables) != len(target_tables):
@@ -205,6 +227,8 @@ def find_suspected_table_omissions(
     ):
         if not table_shapes_match(source_table, target_table):
             continue
+        source_headers = split_markdown_table_cells(source_table.header)
+        target_headers = split_markdown_table_cells(target_table.header)
         if (
             source_table.text == target_table.text
             and contains_translatable_natural_language(
@@ -222,10 +246,10 @@ def find_suspected_table_omissions(
             )
             continue
         if (
-            source_table.header == target_table.header
-            and contains_translatable_natural_language(
-                source_table.header,
-                source_language,
+            any(
+                source_header == target_header
+                and contains_translatable_natural_language(source_header, source_language)
+                for source_header, target_header in zip(source_headers, target_headers)
             )
         ):
             omissions.append(
@@ -245,9 +269,11 @@ def find_suspected_table_omissions(
                 1,
             )
             if any(
-                source_cell == target_cell
+                not _names_or_values_column(header, source_language)
+                and source_cell == target_cell
                 and contains_likely_prose_cell(source_cell, source_language)
-                for source_cell, target_cell in zip(
+                for header, source_cell, target_cell in zip(
+                    source_headers,
                     split_markdown_table_cells(source_row),
                     split_markdown_table_cells(target_row),
                 )
@@ -290,7 +316,21 @@ def validate_repaired_table(source_table, candidate_content):
         "numbers": NUMBER_RE,
         "uppercase identifiers": UPPER_IDENTIFIER_RE,
     }
-    for label, pattern in protected_patterns.items():
-        if pattern.findall(source_table.text) != pattern.findall(candidate_table.text):
-            return None, f"repair changed protected {label}"
+    headers = split_markdown_table_cells(source_table.header)
+    for row_index, (source_row, target_row) in enumerate(zip(source_table.lines, candidate_table.lines)):
+        if row_index == 1:
+            continue
+        for header, source_cell, target_cell in zip(
+            headers, split_markdown_table_cells(source_row), split_markdown_table_cells(target_row),
+        ):
+            for label, pattern in protected_patterns.items():
+                # Geographic names are translatable prose (for example US Central).
+                # Inline code, numbers and URLs remain protected in these cells.
+                if (label == "uppercase identifiers" and row_index > 1
+                        and _normalized_header(header) in {"location", "country", "region", "zone"}):
+                    continue
+                # Translation can reorder a sentence, but must retain every
+                # protected item in its original row and column, including repeats.
+                if Counter(pattern.findall(source_cell)) != Counter(pattern.findall(target_cell)):
+                    return None, f"repair changed protected {label}"
     return candidate_table.text, ""
