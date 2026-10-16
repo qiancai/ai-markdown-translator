@@ -591,6 +591,9 @@ Return the translated lines in the same JSON format:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
+        if getattr(ai_response, "completion_status", "complete") != "complete":
+            thread_safe_print("   ❌ Index translation response is incomplete; target retained")
+            return {}
         json_start = ai_response.find("{")
         json_end = ai_response.rfind("}") + 1
         if json_start == -1 or json_end <= json_start:

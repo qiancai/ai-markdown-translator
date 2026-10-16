@@ -47,6 +47,23 @@ def verbose_thread_safe_print(*args, **kwargs):
         thread_safe_print(*args, **kwargs)
 
 
+def format_duration(seconds):
+    """Format elapsed monotonic time consistently for requests and workflows."""
+    seconds = round(max(0, seconds), 1)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    return f"{int(minutes)}m {remainder:04.1f}s"
+
+
+def _print_timing(message):
+    try:
+        thread_safe_print(message)
+    except (OSError, ValueError):
+        # Closed streams must not replace a result or hide the original error.
+        pass
+
+
 @contextmanager
 def log_context(label):
     parent = _context.get()
@@ -92,8 +109,40 @@ def request_wait_logging(interval=60):
 def log_ai_wait(func):
     @wraps(func)
     def wrapped(*args, **kwargs):
-        with request_wait_logging():
+        started = time.monotonic()
+        outcome = "❌ AI request failed"
+        try:
+            with request_wait_logging():
+                result = func(*args, **kwargs)
+            if result:
+                outcome = (
+                    "⚠️ AI response incomplete"
+                    if getattr(result, "completion_status", "complete") != "complete"
+                    else "✅ AI response"
+                )
+            return result
+        finally:
+            _print_timing(f"{outcome} | {format_duration(time.monotonic() - started)}")
+
+    return wrapped
+
+
+def log_workflow_duration(func):
+    """Report total wall time even on early returns, errors, or SystemExit.
+
+    Finishing the entry point does not imply every file translated successfully;
+    the workflow's existing summary remains authoritative for that outcome.
+    """
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        started = time.monotonic()
+        try:
             return func(*args, **kwargs)
+        finally:
+            _print_timing(
+                "⏱️ Translation workflow elapsed | total "
+                + format_duration(time.monotonic() - started)
+            )
 
     return wrapped
 

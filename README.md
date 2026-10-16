@@ -387,7 +387,11 @@ Customize handling for specific files and folders in `scripts/workflow_ignore_co
 
 `VERBOSE_WORKFLOW_LOGS` defaults to `false`. Compact logs show file paths, batch progress, request sizes, and completion counts per processing group (for example, added files). AI requests still waiting after 60 seconds emit a waiting message every 60 seconds. Progress logs are flushed immediately. Set `VERBOSE_WORKFLOW_LOGS=true` to include glossary matches, detailed diff analysis, full mapping responses, and translation diagnostics. Completion counts describe translation processing, not commits or pushes to GitHub.
 
+Each AI call logs elapsed time on success, incomplete output, or failure, including SDK retries and provider rate-limit waits inside that call. Restructured-file completion and failure logs include total file time from loading snapshots through validation and writing; focused retries are included. Both workflow entry points log their total elapsed time, including early exits and errors. These timings use a monotonic clock. Parallel file durations overlap and must not be added to calculate total workflow time; the entry-point timer excludes external Actions steps such as checkout, dependency installation, and PR creation.
+
 Upgrade note: `VERBOSE_WORKFLOW_LOGS` previously defaulted to `true`. Set it explicitly to `true` to retain the previous detailed diagnostic output after upgrading.
+
+Commit-based sync routes headingless `_index.md` landing pages through the dedicated Index snapshot processor, including newly added or renamed files, initial TOC-scope bootstrap, and explicit full translations. The processor localizes absolute `docs.pingcap.com` URLs for the target language and translates component labels and link text while retaining source structure. A failed Index translation preserves the existing target and is never retried through ordinary whole-file translation. `_index.md` articles with Markdown headings continue to use the regular translation path.
 
 ### Fragment batching for restructured files
 

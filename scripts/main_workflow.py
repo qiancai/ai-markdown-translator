@@ -8,6 +8,7 @@ import os
 import json
 import re
 import subprocess
+import time
 import tiktoken
 from github import Github, Auth
 from product_specific_handler import get_product_name
@@ -36,7 +37,7 @@ os.environ.setdefault(
 
 # Import all modules
 from ai_client import UnifiedAIClient, get_provider_max_tokens
-from workflow_logging import configure_output, thread_safe_print
+from workflow_logging import configure_output, thread_safe_print, format_duration, log_workflow_duration
 from diff_analyzer import (
     analyze_source_changes,
     build_diff_text,
@@ -246,6 +247,7 @@ def reconcile_restructured_files_for_pr(
     )
 
     for file_path in sorted(restructured_files):
+        started = time.monotonic()
         existing_target = read_safe_target_text(TARGET_REPO_PATH, file_path)
         if not existing_target:
             thread_safe_print(
@@ -256,7 +258,8 @@ def reconcile_restructured_files_for_pr(
 
         def mark_reconciliation_failure(reason):
             thread_safe_print(
-                f"   ❌ Reconciler: {reason}; preserving existing target file"
+                f"   ❌ Reconciler: {reason}; preserving existing target file | "
+                f"total {format_duration(time.monotonic() - started)}"
             )
             run_report.mark_failure(file_path, reason)
             failed_paths.add(file_path)
@@ -337,7 +340,10 @@ def reconcile_restructured_files_for_pr(
             )
             continue
 
-        thread_safe_print(f"   ✅ Reconciled (structure-preserving): {file_path}")
+        thread_safe_print(
+            f"   ✅ Reconciled (structure-preserving): {file_path} | "
+            f"total {format_duration(time.monotonic() - started)}"
+        )
         run_report.mark_success(file_path)
         reconciled_paths.add(file_path)
 
@@ -1057,6 +1063,7 @@ def get_workflow_repo_config(pr_url, repo_configs):
     
     return config
 
+@log_workflow_duration
 def main():
     """Main function - orchestrates the entire workflow for GitHub Actions"""
     configure_output()

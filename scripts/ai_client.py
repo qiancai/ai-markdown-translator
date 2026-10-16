@@ -306,7 +306,6 @@ class UnifiedAIClient:
                 )
 
             if response and response.text:
-                thread_safe_print("   ✅ Gemini response received")
                 finish_reason = ""
                 candidates = getattr(response, "candidates", None) or []
                 if candidates:

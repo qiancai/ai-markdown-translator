@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections import Counter
 
 from github import Auth, Github
@@ -54,7 +55,7 @@ os.environ.setdefault(
 )
 
 from ai_client import UnifiedAIClient
-from workflow_logging import configure_output, thread_safe_print
+from workflow_logging import configure_output, thread_safe_print, format_duration, log_workflow_duration
 from diff_analyzer import (
     build_commit_diff_context,
     build_local_commit_diff_context,
@@ -110,7 +111,7 @@ from translation_structure_validator import (
 )
 from workflow_ignore_config import load_workflow_ignore_config
 from workflow_outcome import FileOutcomes, RunReport, record_file_task_result
-from special_file_utils import path_resource_key
+from special_file_utils import path_resource_key, is_index_file_name, is_learning_path_index_content
 
 WORKFLOW_IGNORE_CONFIG = load_workflow_ignore_config()
 COMMIT_BASED_MODE_IGNORE_FILES = WORKFLOW_IGNORE_CONFIG["COMMIT_BASED_MODE_IGNORE_FILES"]
@@ -1418,6 +1419,7 @@ def reconcile_restructured_files(
     rr_ignore = source_mode == "commit" and should_ignore_resource_card_section(repo_config)
 
     for file_path in sorted(restructured_files):
+        started = time.monotonic()
         existing_target = read_target_file_content(TARGET_REPO_PATH, file_path)
         if not existing_target:
             thread_safe_print(
@@ -1428,7 +1430,8 @@ def reconcile_restructured_files(
 
         def mark_reconciliation_failure(reason):
             thread_safe_print(
-                f"   ❌ Reconciler: {reason}; preserving existing target file"
+                f"   ❌ Reconciler: {reason}; preserving existing target file | "
+                f"total {format_duration(time.monotonic() - started)}"
             )
             translation_stats.mark_failure(file_path, reason)
             failed_paths.add(file_path)
@@ -1531,7 +1534,10 @@ def reconcile_restructured_files(
             )
             continue
 
-        thread_safe_print(f"   ✅ Reconciled (structure-preserving): {file_path}")
+        thread_safe_print(
+            f"   ✅ Reconciled (structure-preserving): {file_path} | "
+            f"total {format_duration(time.monotonic() - started)}"
+        )
         translation_stats.mark_success(file_path)
         successful_file_paths.add(file_path)
         reconciled_paths.add(file_path)
@@ -1727,6 +1733,21 @@ def process_translation_group(
                     formatting_files=formatting_files,
                 )
             )
+
+    # New files, renames and full/bootstrap translations can all bypass the
+    # incremental Index classifier. Route their complete snapshots before any
+    # ordinary file translation so locale URLs and component labels are handled
+    # deterministically by the same Index processor used for incremental edits.
+    for file_path, content in list(added_files.items()):
+        if (is_index_file_name(file_path, commit_ignore_files)
+                and is_learning_path_index_content(content)):
+            index_files[file_path] = {
+                "type": "index",
+                "source_base_content": "",
+                "source_head_content": content,
+            }
+            added_files.pop(file_path)
+            restructured_files.discard(file_path)
 
     # Restructured files were rerouted to added_files by
     # detect_restructured_file() in analyze_source_changes().  They need
@@ -2013,6 +2034,7 @@ def process_translation_group(
     })
 
 
+@log_workflow_duration
 def main():
     """Run the commit-based translation workflow."""
     configure_output()
